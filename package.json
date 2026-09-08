@@ -1,0 +1,26 @@
+{
+  "name": "@futovia/dispatch",
+  "version": "0.1.0",
+  "description": "Text your server. A WhatsApp (Twilio) front door that routes your messages to Claude Code and Codex running on your own box.",
+  "type": "module",
+  "license": "MIT",
+  "bin": { "dispatch": "./bin/dispatch.js" },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts start",
+    "start": "node dist/cli.js start",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.263",
+    "@openai/codex-sdk": "^0.153.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

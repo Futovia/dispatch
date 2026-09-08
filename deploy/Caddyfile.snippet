@@ -1,0 +1,7 @@
+# Add to /etc/caddy/Caddyfile, then: sudo systemctl reload caddy
+# Caddy gets the certificate itself. Point DNS for the host at this box first.
+
+dispatch.example.com {
+  encode zstd gzip
+  reverse_proxy 127.0.0.1:8790
+}
