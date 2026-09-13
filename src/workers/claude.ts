@@ -58,6 +58,7 @@ export class ClaudeWorker implements Worker {
         options: {
           cwd: input.cwd,
           resume,
+          forkSession: input.fork ? true : undefined,
           abortController: ac,
           permissionMode: auto ? "bypassPermissions" : "default",
           allowDangerouslySkipPermissions: auto,

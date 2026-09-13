@@ -19,6 +19,8 @@ export interface Config {
   publicUrl: string;
   /** Path Twilio posts to (under publicUrl). */
   webhookPath: string;
+  /** Path Twilio posts delivery statuses to (under publicUrl). */
+  statusPath: string;
   twilio: { accountSid: string; authToken: string; from: string };
   /** WhatsApp addresses allowed to drive the box ("whatsapp:+15551234567"). */
   operators: string[];
@@ -31,7 +33,13 @@ export interface Config {
   jobTimeoutMs: number;
   approvalTimeoutMs: number;
   /** Where non-operator webhooks go (re-signed), if anywhere. */
-  fallthrough?: { url: string; signedUrl: string; command: string };
+  fallthrough?: { url: string; signedUrl: string; command?: string };
+  /** Twilio Content template used for alerts outside the 24h window ({{1}} machine, {{2}} text). */
+  alertTemplateSid?: string;
+  /** How long `dispatch tell` waits for a busy session to go idle before forking instead. */
+  tellIdleWaitMs: number;
+  /** Ceiling for a headless run started by `dispatch tell`. */
+  tellTimeoutMs: number;
   fallthroughReply?: string;
   /** Label for the machine in the agent's system prompt. */
   machineName: string;
@@ -110,7 +118,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ? {
         url: fallthroughUrl,
         signedUrl: merged.DISPATCH_FALLTHROUGH_SIGNED_URL || fallthroughUrl,
-        command: (merged.DISPATCH_FALLTHROUGH_COMMAND || "fwd").replace(/^\//, ""),
+        command: merged.DISPATCH_FALLTHROUGH_COMMAND ? merged.DISPATCH_FALLTHROUGH_COMMAND.replace(/^\//, "") : undefined,
       }
     : undefined;
 
@@ -121,6 +129,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port: num(merged.DISPATCH_PORT, 8790),
     publicUrl,
     webhookPath: "/twilio/whatsapp",
+    statusPath: "/twilio/status",
     twilio: {
       accountSid: need("TWILIO_ACCOUNT_SID"),
       authToken: need("TWILIO_AUTH_TOKEN"),
@@ -137,6 +146,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     approvalTimeoutMs: num(merged.DISPATCH_APPROVAL_TIMEOUT_MIN, 15) * 60_000,
     fallthrough,
     fallthroughReply: merged.DISPATCH_FALLTHROUGH_REPLY || undefined,
+    alertTemplateSid: merged.DISPATCH_ALERT_TEMPLATE_SID || undefined,
+    tellIdleWaitMs: num(merged.DISPATCH_TELL_IDLE_WAIT_SEC, 90) * 1000,
+    tellTimeoutMs: num(merged.DISPATCH_TELL_TIMEOUT_MIN, 30) * 60_000,
     machineName: merged.DISPATCH_MACHINE_NAME || hostname(),
   };
 }
@@ -177,12 +189,22 @@ DISPATCH_PORT=8790
 # Optional. Non-operator webhooks are re-signed and POSTed here (e.g. the bot that
 # used to own this number). DISPATCH_FALLTHROUGH_SIGNED_URL is the URL that service
 # validates the Twilio signature against (defaults to the URL itself).
-# Operators reach it with /fwd <message> (rename with DISPATCH_FALLTHROUGH_COMMAND).
+# Optional: let operators reach that bot too, with /<command> <message>. Blank = no such command.
 DISPATCH_FALLTHROUGH_URL=
 DISPATCH_FALLTHROUGH_SIGNED_URL=
-DISPATCH_FALLTHROUGH_COMMAND=fwd
+DISPATCH_FALLTHROUGH_COMMAND=
 # Or, with no fallthrough, a fixed reply for strangers (blank = silence).
 DISPATCH_FALLTHROUGH_REPLY=
+
+# Optional. A Twilio Content template (approved for WhatsApp) with two variables:
+# {{1}} machine name, {{2}} message. Used only when an alert falls outside the
+# 24h reply window, which plain messages cannot cross.
+DISPATCH_ALERT_TEMPLATE_SID=
+
+# Optional. dispatch tell waits this long for a busy terminal session to finish
+# its turn before forking it instead of stopping it; and caps the headless run.
+DISPATCH_TELL_IDLE_WAIT_SEC=90
+DISPATCH_TELL_TIMEOUT_MIN=30
 
 # Optional limits.
 DISPATCH_MAX_TURNS=200

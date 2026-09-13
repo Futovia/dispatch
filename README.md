@@ -20,7 +20,8 @@ Most "personal AI assistant" projects want to connect to everything, everywhere,
 - **One channel: WhatsApp, via Twilio.** A real business number with a signed webhook. No linked-device hacks, no QR codes, no banned personal accounts, nothing to babysit.
 - **One operator (or a few).** It is *your* box. Strangers who text the number are ignored, or handed to whatever bot used to own it.
 - **No agent loop of its own.** Claude Code and Codex are the best coding agents on earth and they improve every month. Dispatch does not compete with them; it routes to them. Your subscription logins on the box are all the auth it needs.
-- **One conversation, one job at a time.** More texts queue. `/stop` cancels. Each agent keeps its own resumable session, so "and now do the same for staging" just works.
+- **One conversation, one job at a time.** More texts queue. `/stop` cancels. Each agent keeps its own resumable session, so "and now do the same for staging" just works. The session is never reset unless you say `/new`; it auto-compacts, so "what was that email from Henry yesterday" works.
+- **Your other Claude Code sessions are reachable from the same thread.** A terminal session that runs `ping-admin "pr done"` texts you tagged with its project; you reply "merge it" and the root conversation runs that instruction inside that session, with its full history. See "Steering other sessions".
 - **One env file.** No JSON config, no dashboard, no plugin marketplace. `dispatch init`, fill in eight lines, `dispatch start`.
 
 If you want a marketplace of skills, twelve chat platforms, a companion iOS app and a Docker sandbox matrix, use OpenClaw. If you want to text your server, this is it.
@@ -62,9 +63,42 @@ Text what you want done. Anything that is not a command goes to the active agent
 | `/verbose` | narrate tool calls as they happen |
 | `/auto`, `/ask` | act freely, or ask you before every command and edit |
 | `/yes`, `/no` | answer an approval (plain "yes" / "no" works too) |
-| `/fwd <msg>` | send to the fallthrough bot, if you configured one |
+| `/<cmd> <msg>` | send to the fallthrough bot, only if you set `DISPATCH_FALLTHROUGH_COMMAND` |
 
 The agent can text you mid-task from any script: `dispatch send "build green, deploying"`. Pipes work too: `make test 2>&1 | tail -5 | dispatch send`.
+
+## Steering other sessions
+
+You usually have several Claude Code sessions open in terminals, one per project. Dispatch lets the WhatsApp thread act on any of them.
+
+Install the hooks once (they register every session with dispatch; nothing runs unless a session starts, prompts, stops or ends):
+
+```json
+// ~/.claude/settings.json
+"hooks": {
+  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "dispatch hook", "timeout": 5 }] }],
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "dispatch hook", "timeout": 5 }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "dispatch hook", "timeout": 5 }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "dispatch hook", "timeout": 5 }] }]
+}
+```
+
+Then, from any session or script:
+
+| command | what it does |
+|---|---|
+| `dispatch alert "pr done"` | text the operator, tagged with the folder of the Claude Code session it ran from |
+| `dispatch sessions` | live terminal sessions: id, idle/busy, folder, last prompt |
+| `dispatch tell perfit-app "merge the pr"` | run the instruction inside that session's conversation and print the result |
+| `dispatch tell <id> "..." --bg` | return at once; the result is texted when it finishes |
+
+What happens on `tell`: dispatch waits for the target to finish its current turn (up to `DISPATCH_TELL_IDLE_WAIT_SEC`), stops its terminal process (the transcript is already on disk), and resumes the same session id headlessly with your instruction. One transcript, no branches; `claude --resume <id>` in a terminal later shows everything. If the session stays busy it forks the transcript instead and leaves the terminal alone.
+
+The WhatsApp conversation gets the alert as context on your next message, so "pls merge" after a "pr done" alert from perfit-app is routed into that session by the agent itself, using `dispatch tell`. If two sessions could match, it asks which.
+
+## The 24 hour window
+
+WhatsApp lets a business reply freely for 24 hours after your last message. Outside that only an approved template gets through, and Twilio only reports the rejection asynchronously (error 63016 on the status callback). Dispatch handles both: it sends via the template up front when you have not texted for 23 hours, and resends via the template when a status callback reports 63016. Create a Content template with two variables ({{1}} machine name, {{2}} message), get it approved for WhatsApp as a UTILITY template, and set `DISPATCH_ALERT_TEMPLATE_SID`. Without one, alerts after a quiet day are dropped until you text the number.
 
 ## Permissions
 
@@ -83,7 +117,8 @@ Already have a bot on that WhatsApp number? Set `DISPATCH_FALLTHROUGH_URL` to it
 ```
 ~/.dispatch/env             all configuration
 ~/.dispatch/DISPATCH.md     your instructions to the agent, appended to its system prompt
-~/.dispatch/state.json      operator settings and session ids (the agents keep the transcripts)
+~/.dispatch/state.json      operator settings, session ids, pending context (the agents keep the transcripts)
+~/.dispatch/sessions/       one JSON per Claude Code session on the box, written by the hooks
 ~/.dispatch/transcripts/    one JSONL per operator; grep is the UI
 ~/.dispatch/media/          photos and files you sent
 ```
@@ -106,9 +141,7 @@ WhatsApp -> Twilio -> https://host/twilio/whatsapp -> dispatch (127.0.0.1:8790)
                               markdown -> WhatsApp text, chunked -> Twilio -> phone
 ```
 
-Twilio's signature is verified against the public URL before anything is parsed. Twilio retries webhooks that take longer than 15 seconds, so Dispatch acks immediately and works asynchronously; duplicate deliveries are dropped by message id. Outbound messages are capped at 1500 characters each and split at paragraph boundaries.
-
-WhatsApp lets a business reply freely for 24 hours after your last message. After that, `dispatch send` will fail until you text the number again. Twilio message templates would lift that limit; not built.
+Local routes (`/send`, `/alert`, `/tell`, `/sessions`) take a bearer token from state.json, so only processes running as you can use them. Twilio's signature is verified against the public URL before anything is parsed. Twilio retries webhooks that take longer than 15 seconds, so Dispatch acks immediately and works asynchronously; duplicate deliveries are dropped by message id. Outbound messages are capped at 1500 characters each and split at paragraph boundaries.
 
 ## Not built, on purpose (for now)
 
@@ -117,7 +150,7 @@ Voice note transcription, group chats, multiple machines behind one number, a we
 ## Development
 
 ```bash
-npm test          # vitest: signature, formatting, router with fake agents
+npm test          # vitest: signature, formatting, router with fake agents, session registry, alerts and tell
 npm run typecheck
 ```
 

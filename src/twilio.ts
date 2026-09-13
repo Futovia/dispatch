@@ -81,6 +81,8 @@ export class TwilioSendError extends Error {
 
 export interface SendOptions {
   mediaUrl?: string;
+  /** Twilio POSTs delivery status here (sent/delivered/failed/undelivered + ErrorCode). */
+  statusCallback?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -94,7 +96,34 @@ export async function sendWhatsApp(
   const f = opts.fetchImpl ?? fetch;
   const form = new URLSearchParams({ From: from, To: to, Body: body });
   if (opts.mediaUrl) form.set("MediaUrl", opts.mediaUrl);
+  if (opts.statusCallback) form.set("StatusCallback", opts.statusCallback);
   const res = await f(`https://api.twilio.com/2010-04-01/Accounts/${creds.accountSid}/Messages.json`, {
+    method: "POST",
+    headers: { Authorization: basic(creds), "Content-Type": "application/x-www-form-urlencoded" },
+    body: form.toString(),
+  });
+  const json = (await res.json().catch(() => ({}))) as { sid?: string; message?: string; code?: number };
+  if (!res.ok) throw new TwilioSendError(json.message ?? `twilio ${res.status}`, res.status, json.code);
+  return { sid: json.sid ?? "" };
+}
+
+/**
+ * Send an approved WhatsApp Content template. Templates are the only way to
+ * message the operator outside the 24h reply window. Variables cannot contain
+ * newlines; the caller flattens.
+ */
+export async function sendWhatsAppTemplate(
+  creds: TwilioCreds,
+  from: string,
+  to: string,
+  contentSid: string,
+  variables: Record<string, string>,
+  opts: { statusCallback?: string; fetchImpl?: typeof fetch } = {},
+): Promise<{ sid: string }> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const form = new URLSearchParams({ From: from, To: to, ContentSid: contentSid, ContentVariables: JSON.stringify(variables) });
+  if (opts.statusCallback) form.set("StatusCallback", opts.statusCallback);
+  const res = await fetchImpl(`https://api.twilio.com/2010-04-01/Accounts/${creds.accountSid}/Messages.json`, {
     method: "POST",
     headers: { Authorization: basic(creds), "Content-Type": "application/x-www-form-urlencoded" },
     body: form.toString(),

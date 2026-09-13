@@ -1,8 +1,9 @@
 import { existsSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, basename } from "node:path";
 import { homedir, loadavg, freemem, totalmem } from "node:os";
 import type { Config, WorkerName, PermissionPolicy } from "./config.js";
 import type { State, OperatorState } from "./state.js";
+import { Sessions, stopProcess, sleep, type SessionRecord } from "./sessions.js";
 import type { Worker, ApprovalRequest, WorkerEvent } from "./workers/types.js";
 import { parseInbound, type InboundMessage } from "./twilio.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -16,6 +17,7 @@ import { log } from "./log.js";
 export interface RouterDeps {
   config: Config;
   state: State;
+  sessions: Sessions;
   workers: Record<WorkerName, Worker>;
   /** Deliver text to a WhatsApp address (already formatted + chunked by the caller). */
   send: (to: string, text: string) => Promise<void>;
@@ -39,6 +41,34 @@ interface PendingApproval {
   resolve: (ok: boolean) => void;
 }
 
+/** A headless run dispatch started on someone else's session (`dispatch tell`). */
+export interface TellJob {
+  id: string;
+  target: SessionRecord;
+  instruction: string;
+  startedAt: number;
+  ac: AbortController;
+  mode: "resume" | "fork";
+  done: Promise<TellResult>;
+}
+
+export interface TellResult {
+  ok: boolean;
+  text: string;
+  sessionId?: string;
+  mode: "resume" | "fork";
+  ms: number;
+}
+
+export class TellError extends Error {
+  constructor(
+    message: string,
+    readonly candidates: SessionRecord[] = [],
+  ) {
+    super(message);
+  }
+}
+
 const COMMANDS = ["help", "new", "claude", "codex", "cd", "status", "stop", "verbose", "yes", "no", "auto", "ask"];
 const STRANGER_COOLDOWN_MS = 60 * 60 * 1000;
 const SLOW_NOTICE_MS = 45_000;
@@ -49,6 +79,8 @@ export class Router {
   private approvals = new Map<string, PendingApproval>();
   private strangerRepliedAt = new Map<string, number>();
   private permissionOverride = new Map<string, PermissionPolicy>();
+  private tells = new Map<string, TellJob>();
+  private tellSeq = 0;
   readonly startedAt: number;
 
   constructor(private deps: RouterDeps) {
@@ -69,7 +101,19 @@ export class Router {
         elapsedSec: Math.round((this.now() - j.startedAt) / 1000),
       })),
       queued: [...this.queued.entries()].map(([op, q]) => ({ operator: op, count: q.length })),
+      tells: [...this.tells.values()].map((t) => ({
+        id: t.id,
+        session: t.target.id,
+        cwd: t.target.cwd,
+        mode: t.mode,
+        elapsedSec: Math.round((this.now() - t.startedAt) / 1000),
+      })),
     };
+  }
+
+  /** Terminal sessions the operator can steer: everything the hooks registered except our own. */
+  listSessions(): SessionRecord[] {
+    return this.deps.sessions.list({ exclude: this.deps.state.ownSessionIds() });
   }
 
   /** Entry point for a verified Twilio webhook body. Never throws. */
@@ -196,7 +240,8 @@ export class Router {
   }
 
   private helpText(): string {
-    const fwd = this.deps.config.fallthrough ? `\n/${this.deps.config.fallthrough.command} <msg>: send to the old bot on this number` : "";
+    const cmd = this.deps.config.fallthrough?.command;
+    const fwd = cmd ? `\n/${cmd} <msg>: send to the old bot on this number` : "";
     return [
       "just text me what you want done. one task at a time; more texts queue up.",
       "",
@@ -223,8 +268,176 @@ export class Router {
       `folder: ${short(op.cwd)}`,
       `sessions: claude ${sess("claude")}, codex ${sess("codex")}`,
       job ? `running: ${job.worker}, ${fmtDuration(this.now() - job.startedAt)} in${q ? `, ${q} queued` : ""}` : "idle",
+      this.sessionsLine(),
       `box: ${this.deps.config.machineName}, load ${load}, ${freeGb}/${totalGb} GB free, up ${fmtDuration(this.now() - this.startedAt)}`,
     ].join("\n");
+  }
+
+  private sessionsLine(): string {
+    const live = this.listSessions();
+    if (!live.length) return "terminal sessions: none";
+    const parts = live.slice(0, 6).map((r) => `${basename(r.cwd)} (${r.state}${r.id ? ", " + r.id.slice(0, 8) : ""})`);
+    const tells = this.tells.size ? `, ${this.tells.size} being steered` : "";
+    return `terminal sessions: ${parts.join(", ")}${live.length > 6 ? `, +${live.length - 6}` : ""}${tells}`;
+  }
+
+  // ---- alerts (from scripts and other sessions) ---------------------------
+
+  /**
+   * A terminal session (or any script) wants the operator to know something.
+   * Text it, tagged with where it came from, and remember it so the root
+   * conversation knows what happened when the operator replies.
+   */
+  async alert(input: { text: string; cwd?: string; pid?: number; sessionId?: string; to?: string }): Promise<{
+    sessionId?: string;
+    cwd?: string;
+    delivered: boolean;
+  }> {
+    const { state, sessions, config } = this.deps;
+    const own = state.ownSessionIds();
+    let rec: SessionRecord | undefined;
+    if (input.sessionId) rec = sessions.get(input.sessionId);
+    if (!rec && input.pid) rec = sessions.forPid(input.pid, own);
+    if (!rec && input.cwd) rec = sessions.resolve(input.cwd, own)[0];
+    const cwd = rec?.cwd ?? input.cwd;
+    const fromOwn = rec ? own.includes(rec.id) : false;
+    const tag = fromOwn ? undefined : cwd ? basename(cwd) : undefined;
+    const text = tag ? `*${tag}*\n${input.text}` : input.text;
+
+    const at = new Date(this.now()).toISOString();
+    state.addAlert({ at, text: input.text, cwd, sessionId: rec?.id });
+    const targets = input.to ? [input.to] : config.operators;
+    let delivered = true;
+    for (const op of targets) {
+      this.operator(op);
+      if (!fromOwn) {
+        const where = rec ? `session ${rec.id.slice(0, 8)} in ${short(rec.cwd)}` : cwd ? `a script in ${short(cwd)}` : "a script";
+        state.addNote(op, `${at.slice(11, 16)} alert from ${where}: ${input.text}`);
+      }
+      state.transcript(op, { dir: "alert", text: input.text, cwd, sessionId: rec?.id });
+      try {
+        await this.deps.send(op, text);
+      } catch (e) {
+        delivered = false;
+        log.error("alert send failed", { to: op, err: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    return { sessionId: rec?.id, cwd, delivered };
+  }
+
+  // ---- tell: steer another session ------------------------------------------
+
+  /**
+   * Run an instruction inside a terminal session's conversation. If the session
+   * is idle, its CLI process is stopped and the same session id is resumed
+   * headlessly (one transcript, no branches). If it stays busy past the wait,
+   * the transcript is forked instead so nothing in flight is lost.
+   */
+  tell(targetRef: string, instruction: string, opts: { notify?: boolean; force?: "resume" | "fork" } = {}): TellJob {
+    const { state, sessions } = this.deps;
+    const own = state.ownSessionIds();
+    const candidates = sessions.resolve(targetRef, own);
+    if (!candidates.length) throw new TellError(`no live terminal session matches "${targetRef}"`);
+    if (candidates.length > 1) {
+      const names = candidates.map((c) => `${basename(c.cwd)} ${c.id.slice(0, 8)}`).join(", ");
+      throw new TellError(`ambiguous: ${names}. use the session id.`, candidates);
+    }
+    const target = candidates[0]!;
+    if (this.tells.has(target.id)) throw new TellError(`already running an instruction in ${basename(target.cwd)} (${target.id.slice(0, 8)})`);
+    const ac = new AbortController();
+    const id = `tell-${++this.tellSeq}`;
+    const job: TellJob = { id, target, instruction, startedAt: this.now(), ac, mode: opts.force ?? "resume", done: Promise.resolve() as unknown as Promise<TellResult> };
+    job.done = this.runTell(job, opts).finally(() => this.tells.delete(target.id));
+    this.tells.set(target.id, job);
+    return job;
+  }
+
+  private async runTell(job: TellJob, opts: { notify?: boolean; force?: "resume" | "fork" }): Promise<TellResult> {
+    const { config, state, sessions, workers } = this.deps;
+    const target = job.target;
+    const label = basename(target.cwd);
+    const t0 = this.now();
+
+    let mode: "resume" | "fork" = opts.force ?? "resume";
+    if (!opts.force) {
+      // Wait for the terminal session to finish its turn, then take it over.
+      const deadline = this.now() + config.tellIdleWaitMs;
+      let cur = sessions.get(target.id) ?? target;
+      while (cur.state === "busy" && this.now() < deadline && !job.ac.signal.aborted) {
+        await sleep(1000);
+        cur = sessions.get(target.id) ?? cur;
+      }
+      if (cur.state === "busy") {
+        mode = "fork";
+        log.info("tell: session still busy, forking", { session: target.id });
+      }
+    }
+    job.mode = mode;
+
+    if (mode === "resume" && target.pid) {
+      const stopped = await stopProcess(target.pid);
+      if (!stopped) {
+        mode = "fork";
+        job.mode = mode;
+        log.warn("tell: could not stop terminal process, forking", { pid: target.pid });
+      } else {
+        sessions.update(target.id, { state: "taken", takenAt: new Date(this.now()).toISOString(), takenFor: job.instruction.slice(0, 200), pid: 0 });
+      }
+    }
+
+    const timeout = setTimeout(() => job.ac.abort(), config.tellTimeoutMs);
+    let result: TellResult;
+    try {
+      const prompt =
+        `[Instruction from the operator, sent from their phone via dispatch. ` +
+        `This continues your session in ${target.cwd}. Do it, then reply with a short report; the reply is texted back verbatim.]\n\n` +
+        job.instruction;
+      const out = await workers.claude.run({
+        prompt,
+        images: [],
+        cwd: target.cwd,
+        resume: target.id,
+        fork: mode === "fork",
+        signal: job.ac.signal,
+        permissions: "auto",
+        systemPrompt: buildSystemPrompt({ machineName: config.machineName, cwd: target.cwd, stateDir: config.stateDir }),
+        model: config.claudeModel,
+        maxTurns: config.maxTurns,
+        onEvent: () => undefined,
+        approve: async () => true,
+      });
+      let text = out.text.trim();
+      if (out.error === "aborted") text = "stopped before finishing.";
+      else if (out.error && !text) text = `that did not go through: ${out.error}`;
+      else if (out.error) text += `\n\n(ended with: ${out.error})`;
+      if (out.sessionLost) text = `(could not resume session ${target.id.slice(0, 8)}, ran fresh in ${short(target.cwd)})\n\n${text}`;
+      if (!text) text = "done. nothing to report.";
+      if (out.sessionId && out.sessionId !== target.id) sessions.update(target.id, { continuedAs: out.sessionId });
+      result = { ok: !out.error, text, sessionId: out.sessionId ?? target.id, mode, ms: this.now() - t0 };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      log.error("tell crashed", { session: target.id, err: msg });
+      result = { ok: false, text: `crashed: ${msg}`, sessionId: target.id, mode, ms: this.now() - t0 };
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const at = new Date(this.now()).toISOString().slice(11, 16);
+    for (const op of config.operators) {
+      this.operator(op);
+      state.addNote(op, `${at} you told ${label} (${target.id.slice(0, 8)}, ${mode}): "${job.instruction.slice(0, 160)}" -> ${result.text.slice(0, 400)}`);
+      state.transcript(op, { dir: "tell", session: target.id, cwd: target.cwd, mode, instruction: job.instruction, text: result.text, ms: result.ms });
+      if (opts.notify ?? true) await this.say(op, `*${label}*\n${result.text}`);
+    }
+    log.info("tell done", { session: target.id, mode, ms: result.ms, ok: result.ok });
+    return result;
+  }
+
+  stopTell(sessionId: string): boolean {
+    const job = this.tells.get(sessionId);
+    if (!job) return false;
+    job.ac.abort();
+    return true;
   }
 
   // ---- jobs -------------------------------------------------------------
@@ -306,7 +519,15 @@ export class Router {
       }
     }
     const body = msgs.map((m) => m.body.trim()).filter(Boolean).join("\n\n");
-    const prompt = [body, ...notes].filter(Boolean).join("\n\n") || "(the operator sent only attachments)";
+    let prompt = [body, ...notes].filter(Boolean).join("\n\n") || "(the operator sent only attachments)";
+    const since = this.deps.state.takeNotes(from);
+    if (since.length) {
+      prompt =
+        "[Since your last turn, these were already texted to the operator by dispatch; they are context, not new requests:]\n" +
+        since.map((n) => `- ${n}`).join("\n") +
+        "\n\n" +
+        prompt;
+    }
     return { prompt, images };
   }
 

@@ -14,6 +14,17 @@ export interface OperatorState {
   verbose: boolean;
   sessions: Partial<Record<WorkerName, string>>;
   lastInboundAt?: string;
+  /** Things that happened since the operator's last message (alerts, tell outcomes). Fed into the next prompt. */
+  notes?: string[];
+}
+
+export interface AlertRecord {
+  at: string;
+  text: string;
+  cwd?: string;
+  sessionId?: string;
+  /** Outbound WhatsApp MessageSid, when the send went through. */
+  sid?: string;
 }
 
 export interface StateFile {
@@ -22,9 +33,13 @@ export interface StateFile {
   operators: Record<string, OperatorState>;
   /** Recent inbound MessageSids; Twilio retries a webhook it did not get a 200 for. */
   seen: string[];
+  /** Recent alerts sent to the phone, newest last. */
+  alerts?: AlertRecord[];
 }
 
 const SEEN_CAP = 500;
+const ALERT_CAP = 50;
+const NOTE_CAP = 40;
 
 export class State {
   private data: StateFile;
@@ -99,6 +114,40 @@ export class State {
     if (this.data.seen.length > SEEN_CAP) this.data.seen.splice(0, this.data.seen.length - SEEN_CAP);
     this.write(this.data);
     return true;
+  }
+
+  /** Queue a line of context for the operator's next prompt. */
+  addNote(address: string, text: string): void {
+    const op = this.data.operators[address];
+    if (!op) return;
+    op.notes = [...(op.notes ?? []), text].slice(-NOTE_CAP);
+    this.write(this.data);
+  }
+
+  /** Drain queued context. */
+  takeNotes(address: string): string[] {
+    const op = this.data.operators[address];
+    if (!op?.notes?.length) return [];
+    const notes = op.notes;
+    op.notes = [];
+    this.write(this.data);
+    return notes;
+  }
+
+  addAlert(rec: AlertRecord): void {
+    this.data.alerts = [...(this.data.alerts ?? []), rec].slice(-ALERT_CAP);
+    this.write(this.data);
+  }
+
+  alerts(): AlertRecord[] {
+    return this.data.alerts ?? [];
+  }
+
+  /** Every session id dispatch itself drives (so they are never targets of `tell`). */
+  ownSessionIds(): string[] {
+    const ids: string[] = [];
+    for (const op of Object.values(this.data.operators)) for (const id of Object.values(op.sessions)) if (id) ids.push(id);
+    return ids;
   }
 
   /** One JSONL line per inbound/outbound message, per operator. `grep` is the UI. */

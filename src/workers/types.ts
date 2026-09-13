@@ -22,6 +22,8 @@ export interface WorkerRunInput {
   images: string[];
   cwd: string;
   resume?: string;
+  /** With `resume`: continue the transcript under a NEW session id, leaving the original untouched. */
+  fork?: boolean;
   signal: AbortSignal;
   permissions: PermissionPolicy;
   systemPrompt: string;

@@ -1,23 +1,21 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { execFileSync } from "node:child_process";
 import { loadConfig, ConfigError, ENV_TEMPLATE, defaultStateDir, parseEnvFile } from "./config.js";
-import { State } from "./state.js";
-import { Router } from "./router.js";
-import { createDispatchServer } from "./server.js";
-import { ClaudeWorker } from "./workers/claude.js";
-import { CodexWorker } from "./workers/codex.js";
-import { sendWhatsApp, downloadMedia, forwardWebhook, TwilioSendError } from "./twilio.js";
-import { renderForWhatsApp } from "./wa-format.js";
-import { log } from "./log.js";
 
 const USAGE = `dispatch - text your server.
 
-  dispatch init             write ~/.dispatch/env (then fill it in)
-  dispatch start            run the daemon
-  dispatch send "text"      text the operator from any script (or: cmd | dispatch send)
-  dispatch status           what the running daemon is doing
-  dispatch doctor           check logins, config, Twilio, public URL
+  dispatch init                    write ~/.dispatch/env (then fill it in)
+  dispatch start                   run the daemon
+  dispatch send "text"             text the operator from any script (or: cmd | dispatch send)
+  dispatch alert "text"            same, tagged with the Claude Code session it was run from
+  dispatch sessions                terminal Claude Code sessions on this box the operator can steer
+  dispatch tell <target> "text"    run an instruction inside one of those sessions
+                                   target: folder name, path, session id prefix, or "latest"
+                                   --bg (return at once, result is texted) --fork --resume --timeout <min>
+  dispatch hook                    Claude Code hook entry point (reads the hook JSON on stdin)
+  dispatch status                  what the running daemon is doing
+  dispatch doctor                  check logins, config, Twilio, public URL
 `;
 
 async function main(argv: string[]): Promise<void> {
@@ -29,6 +27,14 @@ async function main(argv: string[]): Promise<void> {
       return init();
     case "send":
       return send(rest);
+    case "alert":
+      return alert(rest);
+    case "sessions":
+      return sessions();
+    case "tell":
+      return tell(rest);
+    case "hook":
+      return hook();
     case "status":
       return status();
     case "doctor":
@@ -40,27 +46,92 @@ async function main(argv: string[]): Promise<void> {
 }
 
 async function start(): Promise<void> {
+  // Heavy imports live here so `dispatch hook` (run on every prompt) stays fast.
+  const [{ State }, { Sessions }, { Router }, { createDispatchServer }, { ClaudeWorker }, { CodexWorker }, twilio, { renderForWhatsApp }, { log }] =
+    await Promise.all([
+      import("./state.js"),
+      import("./sessions.js"),
+      import("./router.js"),
+      import("./server.js"),
+      import("./workers/claude.js"),
+      import("./workers/codex.js"),
+      import("./twilio.js"),
+      import("./wa-format.js"),
+      import("./log.js"),
+    ]);
+  const { sendWhatsApp, sendWhatsAppTemplate, downloadMedia, forwardWebhook, TwilioSendError } = twilio;
+
   const config = loadConfig();
   const state = new State(config.stateDir);
+  const sessions = new Sessions(config.stateDir);
   const creds = config.twilio;
+
+  // WhatsApp only lets a business message someone freely for 24h after their
+  // last message. Past that only an approved template gets through, and the
+  // rejection is asynchronous (the API says 200, the status callback says
+  // 63016). So: pick the template up front when the window is clearly closed,
+  // and resend via template when a status callback reports 63016 anyway.
+  const WINDOW_MS = 23 * 60 * 60 * 1000;
+  const statusCallback = config.publicUrl + config.statusPath;
+  const recentOutbound = new Map<string, { to: string; text: string; template: boolean }>();
+  const remember = (sid: string, entry: { to: string; text: string; template: boolean }) => {
+    if (!sid) return;
+    recentOutbound.set(sid, entry);
+    if (recentOutbound.size > 300) recentOutbound.delete(recentOutbound.keys().next().value!);
+  };
+  const windowOpen = (to: string): boolean => {
+    const last = state.operator(to, { worker: config.defaultWorker, cwd: config.workspace }).lastInboundAt;
+    return Boolean(last) && Date.now() - Date.parse(last!) < WINDOW_MS;
+  };
+  const viaTemplate = async (to: string, text: string): Promise<void> => {
+    if (!config.alertTemplateSid) throw new TwilioSendError("outside the 24h window and no DISPATCH_ALERT_TEMPLATE_SID", 0, 63016);
+    // Template variables cannot hold newlines; flatten. The operator texting back reopens the window.
+    const flat = text.replace(/\s*\n+\s*/g, " / ").replace(/\s{4,}/g, "   ").slice(0, 1000);
+    const { sid } = await sendWhatsAppTemplate(creds, config.twilio.from, to, config.alertTemplateSid, { "1": config.machineName, "2": flat }, { statusCallback });
+    remember(sid, { to, text, template: true });
+    log.info("sent via template (outside 24h window)", { to, sid });
+  };
 
   const send = async (to: string, text: string): Promise<void> => {
     for (const part of renderForWhatsApp(text)) {
+      if (!windowOpen(to) && config.alertTemplateSid) {
+        await viaTemplate(to, part);
+        continue;
+      }
       try {
-        await sendWhatsApp(creds, config.twilio.from, to, part);
+        const { sid } = await sendWhatsApp(creds, config.twilio.from, to, part, { statusCallback });
+        remember(sid, { to, text: part, template: false });
       } catch (e) {
         if (e instanceof TwilioSendError && e.outsideWindow) {
-          log.warn("outside WhatsApp 24h window; operator must text first", { to });
-          return;
+          if (!config.alertTemplateSid) {
+            log.warn("outside WhatsApp 24h window and no DISPATCH_ALERT_TEMPLATE_SID; operator must text first", { to });
+            return;
+          }
+          await viaTemplate(to, part);
+          continue;
         }
         throw e;
       }
     }
   };
 
+  const onStatus = async (params: Record<string, string>): Promise<void> => {
+    const sid = params.MessageSid ?? params.SmsSid ?? "";
+    const st = params.MessageStatus ?? "";
+    if (st !== "failed" && st !== "undelivered") return;
+    const code = Number(params.ErrorCode ?? "0");
+    const known = recentOutbound.get(sid);
+    log.warn("outbound message not delivered", { sid, status: st, code, to: params.To, template: known?.template ?? null });
+    if (code === 63016 && known && !known.template && config.alertTemplateSid) {
+      recentOutbound.delete(sid);
+      await viaTemplate(known.to, known.text);
+    }
+  };
+
   const router = new Router({
     config,
     state,
+    sessions,
     workers: { claude: new ClaudeWorker(), codex: new CodexWorker() },
     send,
     forward: async (params) => {
@@ -78,6 +149,7 @@ async function start(): Promise<void> {
     sendToOperators: async (text, to) => {
       for (const op of to ? [to] : config.operators) await send(op, text);
     },
+    onStatus,
   });
 
   server.listen(config.port, config.host, () => {
@@ -88,6 +160,7 @@ async function start(): Promise<void> {
       worker: config.defaultWorker,
       permissions: config.permissions,
       fallthrough: Boolean(config.fallthrough),
+      alertTemplate: Boolean(config.alertTemplateSid),
     });
   });
 
@@ -132,26 +205,139 @@ function local(): { base: string; token: string } {
   return { base: `http://${host}:${port}`, token };
 }
 
-async function send(args: string[]): Promise<void> {
-  let text = args.join(" ").trim();
-  if (!text && !process.stdin.isTTY) {
-    text = readFileSync(0, "utf8").trim();
+async function call(path: string, body?: unknown, method = body === undefined ? "GET" : "POST"): Promise<{ status: number; json: Record<string, unknown> }> {
+  const { base, token } = local();
+  const res = await fetch(`${base}${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const text = await res.text();
+  let parsed: Record<string, unknown> = {};
+  try {
+    parsed = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    parsed = { raw: text };
   }
+  return { status: res.status, json: parsed };
+}
+
+function textFrom(args: string[], usage: string): string {
+  let text = args.join(" ").trim();
+  if (!text && !process.stdin.isTTY) text = readFileSync(0, "utf8").trim();
   if (!text) {
-    process.stderr.write('usage: dispatch send "text"   (or: cmd | dispatch send)\n');
+    process.stderr.write(usage + "\n");
     process.exit(2);
   }
-  const { base, token } = local();
-  const res = await fetch(`${base}/send`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
-  });
-  if (!res.ok) {
-    process.stderr.write(`dispatch send: ${res.status} ${await res.text()}\n`);
+  return text;
+}
+
+async function send(args: string[]): Promise<void> {
+  const text = textFrom(args, 'usage: dispatch send "text"   (or: cmd | dispatch send)');
+  const { status, json } = await call("/send", { text });
+  if (status !== 200) {
+    process.stderr.write(`dispatch send: ${status} ${JSON.stringify(json)}\n`);
     process.exit(1);
   }
   process.stdout.write("sent\n");
+}
+
+async function alert(args: string[]): Promise<void> {
+  const text = textFrom(args, 'usage: dispatch alert "text"   (or: cmd | dispatch alert)');
+  const { status, json } = await call("/alert", { text, cwd: process.cwd(), pid: process.pid });
+  if (status !== 200) {
+    process.stderr.write(`dispatch alert: ${status} ${JSON.stringify(json)}\n`);
+    process.exit(1);
+  }
+  const sid = typeof json.sessionId === "string" ? json.sessionId.slice(0, 8) : "no session";
+  process.stdout.write(`sent (${sid}, ${typeof json.cwd === "string" ? basename(json.cwd) : "no folder"})\n`);
+}
+
+async function sessions(): Promise<void> {
+  const { status, json } = await call("/sessions");
+  if (status !== 200) {
+    process.stderr.write(`dispatch sessions: ${status} ${JSON.stringify(json)}\n`);
+    process.exit(1);
+  }
+  const list = (json.sessions as Array<Record<string, unknown>>) ?? [];
+  if (!list.length) {
+    process.stdout.write("no live terminal sessions registered (hooks installed?)\n");
+    return;
+  }
+  for (const s of list) {
+    const id = String(s.id);
+    const line = [
+      id.slice(0, 8),
+      String(s.state).padEnd(5),
+      String(s.cwd),
+      s.lastPrompt ? `"${String(s.lastPrompt).slice(0, 60)}"` : "",
+      s.takenFor ? `(taken: ${String(s.takenFor).slice(0, 40)})` : "",
+      `updated ${String(s.updatedAt).slice(0, 16).replace("T", " ")}`,
+    ]
+      .filter(Boolean)
+      .join("  ");
+    process.stdout.write(line + "\n");
+  }
+}
+
+async function tell(args: string[]): Promise<void> {
+  let bg = false;
+  let mode: "fork" | "resume" | undefined;
+  let timeoutMin = 10;
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--bg") bg = true;
+    else if (a === "--fork") mode = "fork";
+    else if (a === "--resume") mode = "resume";
+    else if (a === "--timeout") timeoutMin = Number(args[++i] ?? "10") || 10;
+    else positional.push(a);
+  }
+  const [target, ...restWords] = positional;
+  let instruction = restWords.join(" ").trim();
+  if (!instruction && !process.stdin.isTTY) instruction = readFileSync(0, "utf8").trim();
+  if (!target || !instruction) {
+    process.stderr.write('usage: dispatch tell <folder|session-id|latest> "instruction" [--bg] [--fork|--resume] [--timeout <min>]\n');
+    process.exit(2);
+  }
+  const { status, json } = await call("/tell", { target, instruction, waitMs: bg ? 0 : timeoutMin * 60_000, mode });
+  if (status === 409) {
+    process.stderr.write(`dispatch tell: ${String(json.error)}\n`);
+    const cands = (json.candidates as Array<Record<string, unknown>>) ?? [];
+    for (const c of cands) process.stderr.write(`  ${String(c.id).slice(0, 8)}  ${String(c.state)}  ${String(c.cwd)}\n`);
+    process.exit(3);
+  }
+  if (status >= 300) {
+    process.stderr.write(`dispatch tell: ${status} ${JSON.stringify(json)}\n`);
+    process.exit(1);
+  }
+  const where = `${basename(String(json.cwd))} (${String(json.session).slice(0, 8)})`;
+  if (json.done) {
+    process.stdout.write(`[${where}, ${String(json.mode)}, ${Math.round(Number(json.ms) / 1000)}s]\n${String(json.text)}\n`);
+    process.exit(json.ok ? 0 : 1);
+  }
+  process.stdout.write(
+    json.stillRunning
+      ? `still running in ${where} after ${timeoutMin} min; the result will be texted to the operator when it finishes.\n`
+      : `started in ${where}; the result will be texted to the operator when it finishes.\n`,
+  );
+}
+
+/**
+ * Claude Code hook. Registered for SessionStart, UserPromptSubmit, Stop and
+ * SessionEnd in ~/.claude/settings.json. Must be silent (stdout is fed back
+ * into the session for some events) and must never fail the hook.
+ */
+async function hook(): Promise<void> {
+  try {
+    const raw = readFileSync(0, "utf8");
+    const input = JSON.parse(raw) as import("./sessions.js").HookInput;
+    const { Sessions } = await import("./sessions.js");
+    new Sessions(defaultStateDir()).applyHook(input);
+  } catch {
+    // never block Claude Code
+  }
+  process.exit(0);
 }
 
 async function status(): Promise<void> {
@@ -204,6 +390,15 @@ async function doctor(): Promise<void> {
     else bad("public url", `${config.publicUrl}/health -> HTTP ${res.status} (is the daemon running behind the proxy?)`);
   } catch (e) {
     bad("public url", `${config.publicUrl}/health unreachable (${e instanceof Error ? e.message : String(e)})`);
+  }
+
+  const settings = join(process.env.HOME ?? "", ".claude", "settings.json");
+  try {
+    const text = existsSync(settings) ? readFileSync(settings, "utf8") : "";
+    if (/dispatch(\.js)?\s+hook/.test(text)) ok("claude code hooks", "sessions are registered for `dispatch tell`");
+    else bad("claude code hooks", `no "dispatch hook" in ${settings}; see README, Steering other sessions`);
+  } catch (e) {
+    bad("claude code hooks", e instanceof Error ? e.message : String(e));
   }
 
   process.stdout.write(
