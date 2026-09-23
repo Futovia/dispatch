@@ -15,8 +15,9 @@ import { TellError } from "./router.js";
  *   POST /send             local: text the operator(s). `dispatch send` uses it.
  *   POST /alert            local: text the operator, tagged with the calling session. `dispatch alert` / ping-admin.
  *   POST /tell             local: run an instruction inside another terminal session. `dispatch tell`.
+ *   POST /spawn            local: start a fresh Claude Code session in a folder for a subtask. `dispatch spawn`.
  *   GET  /sessions         local: the terminal sessions the hooks registered.
- *   GET  /health           liveness + what is running
+ *   GET  /health           liveness; with the local token, also what is running
  * "local" routes need the bearer token from state.json; only same-user processes can read it.
  */
 const MAX_BODY = 1 << 20;
@@ -40,7 +41,9 @@ export function createDispatchServer(deps: ServerDeps): Server {
     try {
       const url = new URL(req.url ?? "/", "http://local");
       if (req.method === "GET" && url.pathname === "/health") {
-        return json(res, 200, { ok: true, ...deps.router.snapshot() });
+        // Public (the tunnel and doctor probe it): only the local token sees what is running.
+        if (!authorized(req)) return json(res, 200, { ok: true });
+        return json(res, 200, { ok: true, publicUrl: config.publicUrl || null, ...deps.router.snapshot() });
       }
       if (req.method === "POST" && url.pathname === config.webhookPath) {
         return await webhook(req, res);
@@ -56,6 +59,9 @@ export function createDispatchServer(deps: ServerDeps): Server {
       }
       if (req.method === "POST" && url.pathname === "/tell") {
         return await tell(req, res);
+      }
+      if (req.method === "POST" && url.pathname === "/spawn") {
+        return await spawn(req, res);
       }
       if (req.method === "GET" && url.pathname === "/sessions") {
         if (!authorized(req)) return json(res, 401, { error: "unauthorized" });
@@ -157,6 +163,34 @@ export function createDispatchServer(deps: ServerDeps): Server {
     const outcome = await Promise.race([job.done, timer]);
     if (outcome === "timeout") return json(res, 202, { ok: true, started: true, stillRunning: true, ...started });
     json(res, 200, { ok: outcome.ok, done: true, ...started, mode: outcome.mode, model: outcome.model, text: outcome.text, ms: outcome.ms, sessionId: outcome.sessionId, note: outcome.note });
+  }
+
+  async function spawn(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!authorized(req)) return json(res, 401, { error: "unauthorized" });
+    const parsed = await readJson(req, res);
+    if (!parsed) return;
+    const folder = typeof parsed.folder === "string" ? parsed.folder.trim() : "";
+    const instruction = typeof parsed.instruction === "string" ? parsed.instruction.trim() : "";
+    if (!folder || !instruction) return json(res, 400, { error: "folder and instruction required" });
+    const waitMs = typeof parsed.waitMs === "number" ? Math.max(0, parsed.waitMs) : 0;
+    const model = typeof parsed.model === "string" && parsed.model.trim() ? parsed.model.trim() : undefined;
+    let job;
+    try {
+      // A caller that waits for the result prints it itself; it is texted only if the wait runs out.
+      job = deps.router.spawn(folder, instruction, { notify: parsed.notify === undefined ? !waitMs : parsed.notify !== false, model });
+    } catch (e) {
+      if (e instanceof TellError) return json(res, 409, { error: e.message });
+      throw e;
+    }
+    const started = { id: job.id, cwd: job.cwd, model: job.model };
+    if (!waitMs) return json(res, 202, { ok: true, started: true, ...started });
+    const timer = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), waitMs));
+    const outcome = await Promise.race([job.done, timer]);
+    if (outcome === "timeout") {
+      job.notify = true;
+      return json(res, 202, { ok: true, started: true, stillRunning: true, session: job.sessionId, ...started });
+    }
+    json(res, 200, { ok: outcome.ok, done: true, ...started, session: outcome.sessionId, text: outcome.text, ms: outcome.ms });
   }
 
   async function status(req: IncomingMessage, res: ServerResponse): Promise<void> {

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +33,7 @@ function config(dir: string, overrides: Partial<Config> = {}): Config {
     machineName: "testbox",
     tellIdleWaitMs: 200,
     tellTimeoutMs: 10_000,
+    maxSpawns: 2,
     ...overrides,
   };
 }
@@ -585,5 +586,61 @@ describe("Router: alerts and tell", () => {
     expect(() => router.tell("nothing-like-this", "x")).toThrow(/no session matches/);
     await tick();
     expect(sent[0]!.text).toContain('dispatch tell failed: no session matches "nothing-like-this"');
+  });
+
+  it("spawn: starts a fresh session in the folder, texts the result, and registers it for tell", async () => {
+    const { router, sessions } = make({ claudeModel: "opus" });
+    const sub = join(dir, "proj");
+    mkdirSync(sub);
+    claude.reply = async (i) => {
+      i.onSession?.("spawned-1");
+      return { text: "built it", sessionId: "spawned-1" };
+    };
+    const job = router.spawn("proj", "build the thing");
+    expect(job.cwd).toBe(sub);
+    const out = await job.done;
+    expect(out).toMatchObject({ ok: true, text: "built it", sessionId: "spawned-1", model: "opus" });
+    expect(claude.calls[0]!.resume).toBeUndefined();
+    expect(claude.calls[0]!.cwd).toBe(sub);
+    expect(claude.calls[0]!.model).toBe("opus");
+    expect(sent.at(-1)!.text).toContain("*proj* (new session spawned");
+    expect(sent.at(-1)!.text).toContain("built it");
+    expect(sessions.get("spawned-1")).toMatchObject({ cwd: sub, state: "taken", pid: 0 });
+
+    // tell continues the spawned session with nothing to stop.
+    claude.reply = async (i) => ({ text: "continued", sessionId: i.resume });
+    const t = await router.tell("proj", "and add tests").done;
+    expect(t).toMatchObject({ ok: true, mode: "resume", text: "continued" });
+    expect(claude.calls[1]!.resume).toBe("spawned-1");
+  });
+
+  it("spawn: a waiting caller gets the result instead of a text; missing folders and the concurrency cap are refused", async () => {
+    const { router } = make();
+    mkdirSync(join(dir, "a"));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    claude.reply = async () => {
+      await gate;
+      return { text: "ok", sessionId: "s" };
+    };
+    expect(() => router.spawn("nope", "x")).toThrow(/no such folder/);
+    const quiet = router.spawn("a", "one", { notify: false });
+    router.spawn("a", "two");
+    expect(() => router.spawn("a", "three")).toThrow(/DISPATCH_MAX_SPAWNS=2/);
+    expect(router.snapshot().spawns).toHaveLength(2);
+    release();
+    await quiet.done;
+    await tick();
+    expect(sent.filter((m) => m.text.includes("new session"))).toHaveLength(1);
+    expect(router.snapshot().spawns).toHaveLength(0);
+  });
+
+  it("spawn: a failed run is reported as failed", async () => {
+    const { router } = make();
+    claude.reply = async () => ({ text: "", error: "rate limited" });
+    const out = await router.spawn(".", "x").done;
+    expect(out.ok).toBe(false);
+    expect(sent.at(-1)!.text).toContain("failed");
+    expect(sent.at(-1)!.text).toContain("rate limited");
   });
 });

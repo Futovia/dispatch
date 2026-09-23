@@ -15,8 +15,12 @@ export interface Config {
   envFile: string;
   host: string;
   port: number;
-  /** Public https origin Twilio posts to, e.g. https://dispatch.example.com */
+  /** Public https origin Twilio posts to, e.g. https://dispatch.example.com. With a tunnel, filled in at startup. */
   publicUrl: string;
+  /** DISPATCH_PUBLIC_URL=tunnel: run a Cloudflare quick tunnel instead of needing a hostname. */
+  tunnel: boolean;
+  /** Point the Twilio sender's inbound webhook at publicUrl on every start. */
+  autoWebhook: boolean;
   /** Path Twilio posts to (under publicUrl). */
   webhookPath: string;
   /** Path Twilio posts delivery statuses to (under publicUrl). */
@@ -38,8 +42,10 @@ export interface Config {
   alertTemplateSid?: string;
   /** How long `dispatch tell` waits for a busy session to go idle before forking instead. */
   tellIdleWaitMs: number;
-  /** Ceiling for a headless run started by `dispatch tell`. */
+  /** Ceiling for a headless run started by `dispatch tell` or `dispatch spawn`. */
   tellTimeoutMs: number;
+  /** How many `dispatch spawn` sessions may run at once. */
+  maxSpawns: number;
   fallthroughReply?: string;
   /** Label for the machine in the agent's system prompt. */
   machineName: string;
@@ -105,8 +111,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     .map(normalizeAddress);
   if (!operators.length) throw new ConfigError("DISPATCH_OPERATORS must list at least one phone number");
 
-  const publicUrl = need("DISPATCH_PUBLIC_URL").replace(/\/+$/, "");
-  if (!/^https:\/\//.test(publicUrl)) throw new ConfigError("DISPATCH_PUBLIC_URL must be an https origin");
+  const rawUrl = need("DISPATCH_PUBLIC_URL").replace(/\/+$/, "");
+  const tunnel = rawUrl === "tunnel";
+  const publicUrl = tunnel ? "" : rawUrl;
+  if (!tunnel && !/^https:\/\//.test(publicUrl)) throw new ConfigError("DISPATCH_PUBLIC_URL must be an https origin, or: tunnel");
+  const autoWebhook = /^(1|true|yes|on)$/i.test(merged.DISPATCH_AUTO_WEBHOOK || (tunnel ? "true" : "false"));
 
   const worker = (merged.DISPATCH_WORKER ?? "claude") as WorkerName;
   if (worker !== "claude" && worker !== "codex") throw new ConfigError("DISPATCH_WORKER must be claude or codex");
@@ -128,6 +137,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     host: merged.DISPATCH_HOST || "127.0.0.1",
     port: num(merged.DISPATCH_PORT, 8790),
     publicUrl,
+    tunnel,
+    autoWebhook,
     webhookPath: "/twilio/whatsapp",
     statusPath: "/twilio/status",
     twilio: {
@@ -149,6 +160,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     alertTemplateSid: merged.DISPATCH_ALERT_TEMPLATE_SID || undefined,
     tellIdleWaitMs: num(merged.DISPATCH_TELL_IDLE_WAIT_SEC, 90) * 1000,
     tellTimeoutMs: num(merged.DISPATCH_TELL_TIMEOUT_MIN, 30) * 60_000,
+    maxSpawns: num(merged.DISPATCH_MAX_SPAWNS, 4),
     machineName: merged.DISPATCH_MACHINE_NAME || hostname(),
   };
 }
@@ -165,9 +177,14 @@ TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
 # (or forwarded, see DISPATCH_FALLTHROUGH_URL).
 DISPATCH_OPERATORS=+15551234567
 
-# Public https origin Twilio can reach. Point the sender's inbound webhook at
-# <this>/twilio/whatsapp
-DISPATCH_PUBLIC_URL=https://dispatch.example.com
+# Public https origin Twilio can reach, e.g. https://dispatch.example.com behind
+# your reverse proxy. Or: tunnel (a free Cloudflare quick tunnel, no domain needed;
+# its URL changes on every restart, so keep DISPATCH_AUTO_WEBHOOK=true with it).
+DISPATCH_PUBLIC_URL=tunnel
+
+# Point the WhatsApp sender's inbound webhook at <public url>/twilio/whatsapp on
+# every start. Default: true with a tunnel, false with your own URL.
+DISPATCH_AUTO_WEBHOOK=
 
 # Where the agent works by default. /cd changes it per operator.
 DISPATCH_WORKSPACE=${homedir()}
@@ -200,6 +217,9 @@ DISPATCH_FALLTHROUGH_REPLY=
 # {{1}} machine name, {{2}} message. Used only when an alert falls outside the
 # 24h reply window, which plain messages cannot cross.
 DISPATCH_ALERT_TEMPLATE_SID=
+
+# Optional. How many dispatch spawn sessions may run at once.
+DISPATCH_MAX_SPAWNS=4
 
 # Optional. dispatch tell waits this long for a busy terminal session to finish
 # its turn before forking it instead of stopping it; and caps the headless run.

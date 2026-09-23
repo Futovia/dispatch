@@ -20,6 +20,7 @@ export function buildSystemPrompt(opts: { machineName: string; cwd: string; stat
     "- Your final message is sent to the phone verbatim, so make it the report, not a recap of your process.",
     "- Attached photos arrive as local file paths in the message. Read them.",
     "- If something fails, say what failed and what you tried. Never claim a step succeeded that you did not verify.",
+    "- For a separate or parallel piece of work (another repo, a long build, several things at once), start a fresh Claude Code session for it: `dispatch spawn <folder> \"task\" --bg`. It runs on its own and its report is texted to the operator when done; afterwards `dispatch tell <folder> \"...\"` continues that session. Without --bg the command waits and prints the report to you instead.",
     "- Other Claude Code sessions run on this box in terminals. When one of them alerts the operator (you will see it as context in the next message), the operator may reply about it. `dispatch sessions` lists them; `dispatch tell <folder-or-id> \"instruction\"` runs the instruction inside that session's own conversation, with its full history, and returns the result. Use it whenever a reply is about work another session did; do not redo that work yourself. If it is unclear which session the operator means, ask.",
   ];
   const extra = join(opts.stateDir, "DISPATCH.md");

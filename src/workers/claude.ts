@@ -74,6 +74,7 @@ export class ClaudeWorker implements Worker {
       for await (const m of stream as AsyncIterable<SDKMessage>) {
         if (m.type === "system" && m.subtype === "init") {
           sessionId = m.session_id;
+          input.onSession?.(m.session_id);
           input.onEvent({ kind: "status", text: `claude ${m.model}` });
         } else if (m.type === "assistant") {
           for (const block of m.message.content as unknown as Array<Record<string, unknown>>) {

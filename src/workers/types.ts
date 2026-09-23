@@ -30,6 +30,8 @@ export interface WorkerRunInput {
   model?: string;
   maxTurns: number;
   onEvent: (e: WorkerEvent) => void;
+  /** Called as soon as the agent reports its session id. */
+  onSession?: (sessionId: string) => void;
   approve: (req: ApprovalRequest) => Promise<boolean>;
 }
 

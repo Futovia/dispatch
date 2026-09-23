@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, basename } from "node:path";
+import { join, basename, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { loadConfig, ConfigError, ENV_TEMPLATE, defaultStateDir, parseEnvFile } from "./config.js";
 
@@ -14,6 +15,9 @@ const USAGE = `dispatch - text your server.
                                    target: folder name, path, session id prefix, or "latest"
                                    --bg (return at once, result is texted) --fork --resume --timeout <min>
                                    --model <name> (default: DISPATCH_CLAUDE_MODEL)
+  dispatch spawn <folder> "task"   start a fresh Claude Code session in a folder for a subtask
+                                   --bg (return at once, result is texted) --timeout <min> --model <name>
+                                   the session stays registered: dispatch tell <folder> continues it
   dispatch hook                    Claude Code hook entry point (reads the hook JSON on stdin)
   dispatch status                  what the running daemon is doing
   dispatch doctor                  check logins, config, Twilio, public URL
@@ -34,12 +38,16 @@ async function main(argv: string[]): Promise<void> {
       return sessions();
     case "tell":
       return tell(rest);
+    case "spawn":
+      return spawn(rest);
     case "hook":
       return hook();
     case "status":
       return status();
     case "doctor":
       return doctor();
+    case "enable-codex":
+      return enableCodex();
     default:
       process.stdout.write(USAGE);
       process.exit(cmd ? 2 : 0);
@@ -48,14 +56,15 @@ async function main(argv: string[]): Promise<void> {
 
 async function start(): Promise<void> {
   // Heavy imports live here so `dispatch hook` (run on every prompt) stays fast.
-  const [{ State }, { Sessions }, { Router }, { createDispatchServer }, { ClaudeWorker }, { CodexWorker }, twilio, { renderForWhatsApp }, { log }] =
+  const [{ State }, { Sessions }, { Router }, { createDispatchServer }, { ClaudeWorker }, codex, twilio, { renderForWhatsApp }, { log }] =
     await Promise.all([
       import("./state.js"),
       import("./sessions.js"),
       import("./router.js"),
       import("./server.js"),
       import("./workers/claude.js"),
-      import("./workers/codex.js"),
+      // Codex is optional (its SDK is ~300MB): `dispatch enable-codex` installs it.
+      import("./workers/codex.js").catch(() => undefined),
       import("./twilio.js"),
       import("./wa-format.js"),
       import("./log.js"),
@@ -73,7 +82,8 @@ async function start(): Promise<void> {
   // 63016). So: pick the template up front when the window is clearly closed,
   // and resend via template when a status callback reports 63016 anyway.
   const WINDOW_MS = 23 * 60 * 60 * 1000;
-  const statusCallback = config.publicUrl + config.statusPath;
+  // Read at send time: with a tunnel the public URL is only known after startup.
+  const statusCallback = () => (config.publicUrl ? config.publicUrl + config.statusPath : undefined);
   const recentOutbound = new Map<string, { to: string; text: string; template: boolean }>();
   const remember = (sid: string, entry: { to: string; text: string; template: boolean }) => {
     if (!sid) return;
@@ -88,7 +98,7 @@ async function start(): Promise<void> {
     if (!config.alertTemplateSid) throw new TwilioSendError("outside the 24h window and no DISPATCH_ALERT_TEMPLATE_SID", 0, 63016);
     // Template variables cannot hold newlines; flatten. The operator texting back reopens the window.
     const flat = text.replace(/\s*\n+\s*/g, " / ").replace(/\s{4,}/g, "   ").slice(0, 1000);
-    const { sid } = await sendWhatsAppTemplate(creds, config.twilio.from, to, config.alertTemplateSid, { "1": config.machineName, "2": flat }, { statusCallback });
+    const { sid } = await sendWhatsAppTemplate(creds, config.twilio.from, to, config.alertTemplateSid, { "1": config.machineName, "2": flat }, { statusCallback: statusCallback() });
     remember(sid, { to, text, template: true });
     log.info("sent via template (outside 24h window)", { to, sid });
   };
@@ -100,7 +110,7 @@ async function start(): Promise<void> {
         continue;
       }
       try {
-        const { sid } = await sendWhatsApp(creds, config.twilio.from, to, part, { statusCallback });
+        const { sid } = await sendWhatsApp(creds, config.twilio.from, to, part, { statusCallback: statusCallback() });
         remember(sid, { to, text: part, template: false });
       } catch (e) {
         if (e instanceof TwilioSendError && e.outsideWindow) {
@@ -133,7 +143,7 @@ async function start(): Promise<void> {
     config,
     state,
     sessions,
-    workers: { claude: new ClaudeWorker(), codex: new CodexWorker() },
+    workers: { claude: new ClaudeWorker(), codex: codex ? new codex.CodexWorker() : missingCodex() },
     send,
     forward: async (params) => {
       if (!config.fallthrough) return;
@@ -153,10 +163,51 @@ async function start(): Promise<void> {
     onStatus,
   });
 
+  // Twilio must know where to post. With a tunnel the URL is new on every
+  // start (and every tunnel restart), so it is re-pointed each time.
+  const { pointWebhook } = await import("./twilio-admin.js");
+  const wire = async (): Promise<void> => {
+    if (!config.autoWebhook || !config.publicUrl) return;
+    const url = config.publicUrl + config.webhookPath;
+    try {
+      const r = await pointWebhook(creds, config.twilio.from, url, { statusUrl: config.publicUrl + config.statusPath });
+      log.info(r.changed ? "twilio webhook pointed here" : "twilio webhook already points here", { via: r.what, url, previous: r.previous || null });
+    } catch (e) {
+      log.error("could not point the twilio webhook; set it by hand", { url, err: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  let tunnelChild: import("node:child_process").ChildProcess | undefined;
+  let stopping = false;
+  const runTunnel = async (attempt = 0): Promise<void> => {
+    const { ensureCloudflared, startTunnel, waitReachable } = await import("./tunnel.js");
+    try {
+      const bin = await ensureCloudflared(config.stateDir);
+      const t = await startTunnel(bin, config.port);
+      tunnelChild = t.child;
+      config.publicUrl = t.url;
+      writeFileSync(join(config.stateDir, "public-url"), t.url + "\n");
+      log.info("tunnel up", { url: t.url });
+      if (!(await waitReachable(t.url))) log.warn("tunnel URL not reachable yet; twilio may fail until it is", { url: t.url });
+      await wire();
+      t.child.once("exit", (code) => {
+        if (stopping) return;
+        log.warn("tunnel exited, restarting", { code });
+        setTimeout(() => void runTunnel(), 2000);
+      });
+    } catch (e) {
+      const wait = Math.min(60_000, 2000 * 2 ** attempt);
+      log.error("tunnel failed", { err: e instanceof Error ? e.message : String(e), retryInMs: wait });
+      if (!stopping) setTimeout(() => void runTunnel(attempt + 1), wait);
+    }
+  };
+
   server.listen(config.port, config.host, () => {
+    if (config.tunnel) void runTunnel();
+    else void wire();
     log.info("dispatch up", {
       bind: `${config.host}:${config.port}`,
-      webhook: config.publicUrl + config.webhookPath,
+      webhook: config.tunnel ? "(tunnel, URL follows)" : config.publicUrl + config.webhookPath,
       operators: config.operators.length,
       worker: config.defaultWorker,
       permissions: config.permissions,
@@ -166,12 +217,38 @@ async function start(): Promise<void> {
   });
 
   const shutdown = () => {
+    stopping = true;
+    tunnelChild?.kill();
     log.info("dispatch shutting down");
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+function missingCodex(): import("./workers/types.js").Worker {
+  return {
+    name: "codex",
+    run: async () => ({ text: "codex is not installed on this box. run `dispatch enable-codex` there (and log in with `codex login`), or /claude to switch back." }),
+  };
+}
+
+/** Install the optional Codex SDK next to dispatch itself. */
+function enableCodex(): void {
+  const root = packageRoot();
+  process.stdout.write(`installing @openai/codex-sdk into ${root} (about 300MB)...\n`);
+  try {
+    execFileSync("npm", ["install", "--no-save", "--no-audit", "--no-fund", "@openai/codex-sdk@^0.153.4"], { cwd: root, stdio: "inherit" });
+  } catch {
+    process.stderr.write(`failed. if dispatch was installed with sudo, rerun this with sudo.\n`);
+    process.exit(1);
+  }
+  process.stdout.write("done. log in with `codex login`, restart dispatch, then text /codex.\n");
+}
+
+function packageRoot(): string {
+  return dirname(dirname(fileURLToPath(import.meta.url)));
 }
 
 function init(): void {
@@ -330,6 +407,46 @@ async function tell(args: string[]): Promise<void> {
   );
 }
 
+async function spawn(args: string[]): Promise<void> {
+  let bg = false;
+  let timeoutMin = 30;
+  let model: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--bg") bg = true;
+    else if (a === "--timeout") timeoutMin = Number(args[++i] ?? "30") || 30;
+    else if (a === "--model") model = args[++i];
+    else if (a.startsWith("--model=")) model = a.slice("--model=".length);
+    else positional.push(a);
+  }
+  const [folder, ...restWords] = positional;
+  let instruction = restWords.join(" ").trim();
+  if (!instruction && !process.stdin.isTTY) instruction = readFileSync(0, "utf8").trim();
+  if (!folder || !instruction) {
+    process.stderr.write('usage: dispatch spawn <folder> "task" [--bg] [--timeout <min>] [--model <name>]\n');
+    process.exit(2);
+  }
+  // Relative folders are relative to where the command runs, not the daemon's workspace.
+  const abs = folder.startsWith("/") || folder.startsWith("~") ? folder : join(process.cwd(), folder);
+  const { status, json } = await call("/spawn", { folder: abs, instruction, waitMs: bg ? 0 : timeoutMin * 60_000, model });
+  if (status >= 300) {
+    process.stderr.write(`dispatch spawn: ${String(json.error ?? JSON.stringify(json))}\n`);
+    process.exit(status === 409 ? 3 : 1);
+  }
+  const where = basename(String(json.cwd));
+  if (json.done) {
+    const sid = typeof json.session === "string" ? json.session.slice(0, 8) : "?";
+    process.stdout.write(`[${where}, new session ${sid}, ${Math.round(Number(json.ms) / 1000)}s${json.ok ? "" : ", FAILED"}]\n${String(json.text)}\n`);
+    process.exit(json.ok ? 0 : 1);
+  }
+  process.stdout.write(
+    json.stillRunning
+      ? `still running in ${where} after ${timeoutMin} min; the result will be texted to the operator when it finishes.\n`
+      : `started a new session in ${where}; the result will be texted to the operator when it finishes.\n`,
+  );
+}
+
 /**
  * Claude Code hook. Registered for SessionStart, UserPromptSubmit, Stop and
  * SessionEnd in ~/.claude/settings.json. Must be silent (stdout is fed back
@@ -348,9 +465,12 @@ async function hook(): Promise<void> {
 }
 
 async function status(): Promise<void> {
-  const { base } = local();
-  const res = await fetch(`${base}/health`);
-  process.stdout.write(JSON.stringify(await res.json(), null, 2) + "\n");
+  const { status, json } = await call("/health");
+  if (status !== 200) {
+    process.stderr.write(`dispatch status: ${status} ${JSON.stringify(json)}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(JSON.stringify(json, null, 2) + "\n");
 }
 
 async function doctor(): Promise<void> {

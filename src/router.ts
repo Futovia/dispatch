@@ -75,6 +75,34 @@ export interface TellOptions {
   model?: string;
 }
 
+/** A fresh headless Claude session dispatch started for a subtask (`dispatch spawn`). */
+export interface SpawnJob {
+  id: string;
+  cwd: string;
+  instruction: string;
+  startedAt: number;
+  ac: AbortController;
+  model?: string;
+  /** Set once the SDK reports the new session id. */
+  sessionId?: string;
+  /** Text the result to the operator when done. A waiting caller that gives up flips this on. */
+  notify: boolean;
+  done: Promise<SpawnResult>;
+}
+
+export interface SpawnResult {
+  ok: boolean;
+  text: string;
+  sessionId?: string;
+  ms: number;
+  model?: string;
+}
+
+export interface SpawnOptions {
+  notify?: boolean;
+  model?: string;
+}
+
 export class TellError extends Error {
   constructor(
     message: string,
@@ -96,6 +124,8 @@ export class Router {
   private permissionOverride = new Map<string, PermissionPolicy>();
   private tells = new Map<string, TellJob>();
   private tellSeq = 0;
+  private spawns = new Map<string, SpawnJob>();
+  private spawnSeq = 0;
   readonly startedAt: number;
 
   constructor(private deps: RouterDeps) {
@@ -122,6 +152,12 @@ export class Router {
         cwd: t.target.cwd,
         mode: t.mode,
         elapsedSec: Math.round((this.now() - t.startedAt) / 1000),
+      })),
+      spawns: [...this.spawns.values()].map((j) => ({
+        id: j.id,
+        session: j.sessionId ?? null,
+        cwd: j.cwd,
+        elapsedSec: Math.round((this.now() - j.startedAt) / 1000),
       })),
     };
   }
@@ -510,6 +546,107 @@ export class Router {
     if (!pid) return { ok: true, how: "nothing" };
     if (await stopProcess(pid)) return { ok: true, how: "terminal" };
     return { ok: false, error: `process ${pid} did not exit on SIGTERM/SIGKILL` };
+  }
+
+  // ---- spawn: a fresh session for a subtask ---------------------------------
+
+  /**
+   * Start a brand new Claude Code session in a folder and hand it one task.
+   * Runs headless and in parallel with everything else; the result is texted
+   * to the operator. Afterwards the session is registered like any terminal
+   * session, so `dispatch tell <folder>` continues it with its full history.
+   */
+  spawn(folder: string, instruction: string, opts: SpawnOptions = {}): SpawnJob {
+    const { config } = this.deps;
+    const cwd = resolve(config.workspace, folder.trim().replace(/^~(?=$|\/)/, homedir()) || ".");
+    if (!existsSync(cwd) || !statSync(cwd).isDirectory()) throw new TellError(`no such folder: ${cwd}`);
+    if (this.spawns.size >= config.maxSpawns) {
+      throw new TellError(`already running ${this.spawns.size} spawned sessions (DISPATCH_MAX_SPAWNS=${config.maxSpawns}); wait for one to finish`);
+    }
+    const job: SpawnJob = {
+      id: `spawn-${++this.spawnSeq}`,
+      cwd,
+      instruction,
+      startedAt: this.now(),
+      ac: new AbortController(),
+      model: opts.model ?? config.claudeModel,
+      notify: opts.notify ?? true,
+      done: Promise.resolve() as unknown as Promise<SpawnResult>,
+    };
+    job.done = this.runSpawn(job).finally(() => this.spawns.delete(job.id));
+    this.spawns.set(job.id, job);
+    return job;
+  }
+
+  private async runSpawn(job: SpawnJob): Promise<SpawnResult> {
+    const { config, state, sessions, workers } = this.deps;
+    const label = basename(job.cwd);
+    const t0 = this.now();
+    const timeout = setTimeout(() => job.ac.abort(), config.tellTimeoutMs);
+    let result: SpawnResult;
+    try {
+      const prompt =
+        `[Task from the operator, sent from their phone via dispatch. You are a fresh session in ${job.cwd}. ` +
+        `Do it end to end, then reply with a short report; the reply is texted back verbatim.]\n\n` +
+        job.instruction;
+      const out = await workers.claude.run({
+        prompt,
+        images: [],
+        cwd: job.cwd,
+        signal: job.ac.signal,
+        permissions: "auto",
+        systemPrompt: buildSystemPrompt({ machineName: config.machineName, cwd: job.cwd, stateDir: config.stateDir }),
+        model: job.model,
+        maxTurns: config.maxTurns,
+        onEvent: () => undefined,
+        onSession: (id) => {
+          job.sessionId = id;
+        },
+        approve: async () => true,
+      });
+      let text = out.text.trim();
+      if (out.error === "aborted") text = this.now() - t0 >= config.tellTimeoutMs ? `stopped: hit the ${Math.round(config.tellTimeoutMs / 60000)} min timeout.` : "stopped before finishing.";
+      else if (out.error && !text) text = `that did not go through: ${out.error}`;
+      else if (out.error) text += `\n\n(ended with: ${out.error})`;
+      if (!text) text = "done. nothing to report.";
+      result = { ok: !out.error, text, sessionId: out.sessionId ?? job.sessionId, ms: this.now() - t0, model: job.model };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      log.error("spawn crashed", { cwd: job.cwd, err: msg });
+      result = { ok: false, text: `crashed: ${msg}`, sessionId: job.sessionId, ms: this.now() - t0, model: job.model };
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    // Register the new session so `dispatch tell` can continue it later. With
+    // the hooks installed it is already there; this covers boxes without them.
+    if (result.sessionId) {
+      const ts = new Date(this.now()).toISOString();
+      const existing = sessions.get(result.sessionId);
+      sessions.put({
+        ...existing,
+        id: result.sessionId,
+        cwd: job.cwd,
+        pid: 0,
+        state: "taken",
+        startedAt: existing?.startedAt ?? new Date(t0).toISOString(),
+        updatedAt: ts,
+        takenAt: ts,
+        takenFor: job.instruction.slice(0, 200),
+        lastPrompt: job.instruction.split("\n")[0]!.slice(0, 120),
+      });
+    }
+
+    const sid = result.sessionId ? result.sessionId.slice(0, 8) : "no session";
+    const at = new Date(this.now()).toISOString().slice(11, 16);
+    for (const op of config.operators) {
+      this.operator(op);
+      state.addNote(op, `${at} spawned a session in ${label} (${sid}${result.ok ? "" : ", FAILED"}): "${job.instruction.slice(0, 160)}" -> ${result.text.slice(0, 400)}`);
+      state.transcript(op, { dir: "spawn", session: result.sessionId, cwd: job.cwd, model: job.model, ok: result.ok, instruction: job.instruction, text: result.text, ms: result.ms });
+      if (job.notify) await this.say(op, `*${label}* (new session ${sid}${result.ok ? "" : ", failed"})\n${result.text}`);
+    }
+    log.info("spawn done", { cwd: job.cwd, session: result.sessionId, ms: result.ms, ok: result.ok });
+    return result;
   }
 
   stopTell(sessionId: string): boolean {
