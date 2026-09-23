@@ -21,6 +21,10 @@ export interface Config {
   tunnel: boolean;
   /** Point the Twilio sender's inbound webhook at publicUrl on every start. */
   autoWebhook: boolean;
+  /** The sender's Messaging Service is shared with other numbers and may be repointed anyway. */
+  sharedService: boolean;
+  /** Let the agent run with full permissions as root (Claude Code refuses otherwise). */
+  allowRoot: boolean;
   /** Path Twilio posts to (under publicUrl). */
   webhookPath: string;
   /** Path Twilio posts delivery statuses to (under publicUrl). */
@@ -139,6 +143,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     publicUrl,
     tunnel,
     autoWebhook,
+    sharedService: /^(1|true|yes|on)$/i.test(merged.DISPATCH_SHARED_SERVICE ?? ""),
+    allowRoot: /^(1|true|yes|on)$/i.test(merged.DISPATCH_ALLOW_ROOT ?? ""),
     webhookPath: "/twilio/whatsapp",
     statusPath: "/twilio/status",
     twilio: {

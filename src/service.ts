@@ -86,8 +86,17 @@ export function launchdPlist(node = process.execPath, cli = cliPath(), path = se
 const unitFile = () => join(homedir(), ".config", "systemd", "user", `${NAME()}.service`);
 const plistFile = () => join(homedir(), "Library", "LaunchAgents", `${LABEL()}.plist`);
 
+/** `su - user` and some ssh setups leave these unset, and then systemctl --user cannot find the user manager. */
+function userBusEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  const uid = process.getuid?.();
+  if (uid !== undefined && !env.XDG_RUNTIME_DIR && existsSync(`/run/user/${uid}`)) env.XDG_RUNTIME_DIR = `/run/user/${uid}`;
+  if (env.XDG_RUNTIME_DIR && !env.DBUS_SESSION_BUS_ADDRESS && existsSync(`${env.XDG_RUNTIME_DIR}/bus`)) env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${env.XDG_RUNTIME_DIR}/bus`;
+  return env;
+}
+
 function run(cmd: string, args: string[], quiet = false): { ok: boolean; out: string } {
-  const r = spawnSync(cmd, args, { encoding: "utf8", stdio: quiet ? "pipe" : ["ignore", "inherit", "inherit"] });
+  const r = spawnSync(cmd, args, { encoding: "utf8", env: userBusEnv(), stdio: quiet ? "pipe" : ["ignore", "inherit", "inherit"] });
   return { ok: r.status === 0, out: `${r.stdout ?? ""}${r.stderr ?? ""}`.trim() };
 }
 

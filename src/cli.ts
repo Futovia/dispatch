@@ -1,13 +1,16 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { loadConfig, ConfigError, ENV_TEMPLATE, defaultStateDir, parseEnvFile } from "./config.js";
+import { loadConfig, ConfigError, defaultStateDir, parseEnvFile } from "./config.js";
 
 const USAGE = `dispatch - text your server.
 
-  dispatch init                    write ~/.dispatch/env (then fill it in)
-  dispatch start                   run the daemon
+  dispatch init                    guided setup: Twilio, your number, webhook, hooks, service
+                                   non-interactive: --sid AC.. --token .. --from +1.. --operator +1..
+                                   [--url https://host|tunnel] [--yes] [--no-service] [--no-hooks] [--no-webhook]
+  dispatch start                   run the daemon in the foreground
+  dispatch service install         run it as a service (systemd user unit / launchd), also: uninstall, status, logs
   dispatch send "text"             text the operator from any script (or: cmd | dispatch send)
   dispatch alert "text"            same, tagged with the Claude Code session it was run from
   dispatch sessions                terminal Claude Code sessions on this box the operator can steer
@@ -20,7 +23,9 @@ const USAGE = `dispatch - text your server.
                                    the session stays registered: dispatch tell <folder> continues it
   dispatch hook                    Claude Code hook entry point (reads the hook JSON on stdin)
   dispatch status                  what the running daemon is doing
-  dispatch doctor                  check logins, config, Twilio, public URL
+  dispatch doctor                  check logins, config, Twilio, webhook, public URL
+  dispatch enable-codex            install the optional Codex worker (/codex)
+  dispatch --version
 `;
 
 async function main(argv: string[]): Promise<void> {
@@ -29,7 +34,9 @@ async function main(argv: string[]): Promise<void> {
     case "start":
       return start();
     case "init":
-      return init();
+      return (await import("./init.js")).init(rest);
+    case "service":
+      return service(rest);
     case "send":
       return send(rest);
     case "alert":
@@ -48,6 +55,11 @@ async function main(argv: string[]): Promise<void> {
       return doctor();
     case "enable-codex":
       return enableCodex();
+    case "--version":
+    case "-v":
+    case "version":
+      process.stdout.write(JSON.parse(readFileSync(join(packageRoot(), "package.json"), "utf8")).version + "\n");
+      return;
     default:
       process.stdout.write(USAGE);
       process.exit(cmd ? 2 : 0);
@@ -72,6 +84,7 @@ async function start(): Promise<void> {
   const { sendWhatsApp, sendWhatsAppTemplate, downloadMedia, forwardWebhook, TwilioSendError } = twilio;
 
   const config = loadConfig();
+  if (config.allowRoot) process.env.DISPATCH_ALLOW_ROOT = "1"; // read by the claude worker
   const state = new State(config.stateDir);
   const sessions = new Sessions(config.stateDir);
   const creds = config.twilio;
@@ -170,7 +183,7 @@ async function start(): Promise<void> {
     if (!config.autoWebhook || !config.publicUrl) return;
     const url = config.publicUrl + config.webhookPath;
     try {
-      const r = await pointWebhook(creds, config.twilio.from, url, { statusUrl: config.publicUrl + config.statusPath });
+      const r = await pointWebhook(creds, config.twilio.from, url, { statusUrl: config.publicUrl + config.statusPath, allowShared: config.sharedService });
       log.info(r.changed ? "twilio webhook pointed here" : "twilio webhook already points here", { via: r.what, url, previous: r.previous || null });
     } catch (e) {
       log.error("could not point the twilio webhook; set it by hand", { url, err: e instanceof Error ? e.message : String(e) });
@@ -251,23 +264,22 @@ function packageRoot(): string {
   return dirname(dirname(fileURLToPath(import.meta.url)));
 }
 
-function init(): void {
-  const dir = defaultStateDir();
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const file = join(dir, "env");
-  if (existsSync(file)) {
-    process.stdout.write(`${file} already exists. edit it, then: dispatch doctor\n`);
-    return;
+async function service(args: string[]): Promise<void> {
+  const svc = await import("./service.js");
+  switch (args[0]) {
+    case "install":
+      loadConfig(); // refuse to install something that cannot start
+      process.exit(svc.installService() ? 0 : 1);
+    case "uninstall":
+      return svc.uninstallService();
+    case "status":
+      return svc.serviceStatus();
+    case "logs":
+      return svc.serviceLogs();
+    default:
+      process.stderr.write("usage: dispatch service install|uninstall|status|logs\n");
+      process.exit(2);
   }
-  writeFileSync(file, ENV_TEMPLATE, { mode: 0o600 });
-  const md = join(dir, "DISPATCH.md");
-  if (!existsSync(md)) {
-    writeFileSync(
-      md,
-      "# Operator instructions\n\nAnything here is appended to the agent's system prompt. House rules, persona, where things live.\n",
-    );
-  }
-  process.stdout.write(`wrote ${file}\nfill it in, then: dispatch doctor && dispatch start\n`);
 }
 
 /** Talk to the local daemon: reads the port from the env file and the token from state.json. */
@@ -476,6 +488,7 @@ async function status(): Promise<void> {
 async function doctor(): Promise<void> {
   let failed = false;
   const ok = (label: string, detail = "") => process.stdout.write(`  ok    ${label}${detail ? "  " + detail : ""}\n`);
+  const warn = (label: string, detail = "") => process.stdout.write(`  warn  ${label}${detail ? "  " + detail : ""}\n`);
   const bad = (label: string, detail = "") => {
     failed = true;
     process.stdout.write(`  FAIL  ${label}${detail ? "  " + detail : ""}\n`);
@@ -486,53 +499,89 @@ async function doctor(): Promise<void> {
     config = loadConfig();
     ok("config", config.envFile);
   } catch (e) {
-    bad("config", e instanceof Error ? e.message : String(e));
+    bad("config", `${e instanceof Error ? e.message : String(e)} (run: dispatch init)`);
     process.exit(1);
   }
 
-  for (const bin of ["claude", "codex"]) {
-    try {
-      const v = execFileSync(bin, ["--version"], { encoding: "utf8", timeout: 20_000 }).trim();
-      ok(bin, v.split("\n")[0]);
-    } catch {
-      bad(bin, "not on PATH (install it and log in)");
-    }
+  if (process.getuid?.() === 0) {
+    if (config.allowRoot) warn("running as root", "DISPATCH_ALLOW_ROOT is set; the agent has root");
+    else bad("running as root", "Claude Code will not take full permissions as root. use a normal user (the installer creates one), or set DISPATCH_ALLOW_ROOT=1");
   }
 
+  const { claudeBin, claudeLoggedIn } = await import("./init.js");
+  const login = claudeLoggedIn(claudeBin());
+  if (login.ok) ok("claude login", login.who ?? "");
+  else bad("claude login", "not logged in: claude auth login (or set ANTHROPIC_API_KEY)");
+
   try {
-    const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${config.twilio.accountSid}.json`, {
-      headers: {
-        Authorization: "Basic " + Buffer.from(`${config.twilio.accountSid}:${config.twilio.authToken}`).toString("base64"),
-      },
-    });
-    if (res.ok) ok("twilio credentials");
-    else bad("twilio credentials", `HTTP ${res.status}`);
+    await import("./workers/codex.js");
+    ok("codex", "installed (/codex)");
+  } catch {
+    ok("codex", "not installed (optional: dispatch enable-codex)");
+  }
+
+  const admin = await import("./twilio-admin.js");
+  let credsOk = false;
+  try {
+    const acct = await admin.checkCredentials(config.twilio);
+    ok("twilio credentials", `account "${acct.name}"`);
+    credsOk = true;
   } catch (e) {
     bad("twilio credentials", e instanceof Error ? e.message : String(e));
   }
 
+  // With a tunnel, the URL is whatever the running daemon last got.
+  let publicUrl = config.publicUrl;
+  if (config.tunnel) {
+    const f = join(config.stateDir, "public-url");
+    publicUrl = existsSync(f) ? readFileSync(f, "utf8").trim() : "";
+    if (!publicUrl) warn("tunnel", "no tunnel URL yet: is the daemon running? (dispatch start)");
+  }
+
+  if (publicUrl) {
+    try {
+      const res = await fetch(`${publicUrl}/health`, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) ok("public url", `${publicUrl}/health`);
+      else bad("public url", `${publicUrl}/health -> HTTP ${res.status} (is the daemon running behind the proxy?)`);
+    } catch (e) {
+      bad("public url", `${publicUrl}/health unreachable (${e instanceof Error ? e.message : String(e)})`);
+    }
+  }
+
+  if (credsOk) {
+    try {
+      const r = await admin.routing(config.twilio, config.twilio.from);
+      const want = publicUrl ? publicUrl + config.webhookPath : "";
+      const where = r.via === "service" ? `Messaging Service "${r.service?.name}"` : `sender ${config.twilio.from}`;
+      if (r.via === "unknown") bad("whatsapp sender", `${config.twilio.from} is not a WhatsApp sender on this account`);
+      else if (want && r.effectiveUrl === want) ok("twilio webhook", `${where} -> ${want}`);
+      else if (config.twilio.from === admin.SANDBOX_ADDRESS)
+        warn("twilio webhook", `sandbox shows ${r.effectiveUrl || "nothing"}; make sure "when a message comes in" at ${admin.SANDBOX_CONSOLE} is ${want || "<public url>/twilio/whatsapp"}`);
+      else bad("twilio webhook", `${where} -> ${r.effectiveUrl || "nothing"}, expected ${want || "<public url>/twilio/whatsapp"}${config.autoWebhook ? " (restart dispatch to re-point it)" : " (set DISPATCH_AUTO_WEBHOOK=true, or set it in the Twilio console)"}`);
+    } catch (e) {
+      warn("twilio webhook", `could not read routing: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   try {
-    const res = await fetch(`${config.publicUrl}/health`, { signal: AbortSignal.timeout(8000) });
-    if (res.ok) ok("public url", `${config.publicUrl}/health`);
-    else bad("public url", `${config.publicUrl}/health -> HTTP ${res.status} (is the daemon running behind the proxy?)`);
-  } catch (e) {
-    bad("public url", `${config.publicUrl}/health unreachable (${e instanceof Error ? e.message : String(e)})`);
+    const { base } = local();
+    const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(3000) });
+    if (res.ok) ok("daemon", `running on ${base}`);
+    else bad("daemon", `${base}/health -> HTTP ${res.status}`);
+  } catch {
+    warn("daemon", "not running (dispatch start, or dispatch service install)");
   }
 
   const settings = join(process.env.HOME ?? "", ".claude", "settings.json");
   try {
     const text = existsSync(settings) ? readFileSync(settings, "utf8") : "";
-    if (/dispatch(\.js)?\s+hook/.test(text)) ok("claude code hooks", "sessions are registered for `dispatch tell`");
-    else bad("claude code hooks", `no "dispatch hook" in ${settings}; see README, Steering other sessions`);
+    if (/(dispatch|cli\.js)\s+hook/.test(text)) ok("claude code hooks", "terminal sessions are registered for dispatch tell");
+    else warn("claude code hooks", "not installed (optional; needed only to steer terminal sessions). dispatch init adds them");
   } catch (e) {
-    bad("claude code hooks", e instanceof Error ? e.message : String(e));
+    warn("claude code hooks", e instanceof Error ? e.message : String(e));
   }
 
-  process.stdout.write(
-    failed
-      ? "\nfix the FAIL lines, then: dispatch start\n"
-      : `\nall good. point the Twilio sender webhook at ${config.publicUrl}${config.webhookPath}\n`,
-  );
+  process.stdout.write(failed ? "\nfix the FAIL lines above.\n" : "\nall good. text the number.\n");
   process.exit(failed ? 1 : 0);
 }
 

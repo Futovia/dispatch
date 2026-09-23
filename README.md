@@ -2,7 +2,7 @@
 
 **Text your server.**
 
-One WhatsApp number, wired through Twilio, straight to Claude Code and Codex running on your own box. You text, the agent works the machine, you get the result on your phone.
+A WhatsApp number, wired through Twilio, straight to Claude Code running on your own box. You text, Claude works the machine, you get the result on your phone. It can start fresh Claude sessions for side jobs and run several at once.
 
 ```
 you:       is the site up? deploy says green but it feels slow
@@ -13,65 +13,127 @@ you:       yes
 dispatch:  done. deployed 4f1c2a9, p95 now 180ms.
 ```
 
-## The opinion
-
-Most "personal AI assistant" projects want to connect to everything, everywhere, for everyone. Dispatch does one thing:
-
-- **One channel: WhatsApp, via Twilio.** A real business number with a signed webhook. No linked-device hacks, no QR codes, no banned personal accounts, nothing to babysit.
-- **One operator (or a few).** It is *your* box. Strangers who text the number are ignored, or handed to whatever bot used to own it.
-- **No agent loop of its own.** Claude Code and Codex are the best coding agents on earth and they improve every month. Dispatch does not compete with them; it routes to them. Your subscription logins on the box are all the auth it needs.
-- **One conversation, one job at a time.** More texts queue. `/stop` cancels. Each agent keeps its own resumable session, so "and now do the same for staging" just works. The session is never reset unless you say `/new`; it auto-compacts, so "what was that email from Henry yesterday" works.
-- **Your other Claude Code sessions are reachable from the same thread.** A terminal session that runs `ping-admin "pr done"` texts you tagged with its project; you reply "merge it" and the root conversation runs that instruction inside that session, with its full history. See "Steering other sessions".
-- **One env file.** No JSON config, no dashboard, no plugin marketplace. `dispatch init`, fill in eight lines, `dispatch start`.
-
-If you want a marketplace of skills, twelve chat platforms, a companion iOS app and a Docker sandbox matrix, use OpenClaw. If you want to text your server, this is it.
-
-## Requirements
-
-- Linux or macOS box with Node 22+
-- `claude` (Claude Code) and/or `codex` CLIs installed and logged in
-- A Twilio account with a WhatsApp sender (the free sandbox works for trying it out)
-- An https hostname that reaches the box (Caddy, nginx, a tunnel; anything)
-
 ## Install
 
-```bash
-git clone https://github.com/Futovia/dispatch && cd dispatch
-npm install && npm run build
-ln -s "$PWD/bin/dispatch.js" ~/.local/bin/dispatch
+On the box (a VPS, a home server, a Mac mini under the desk):
 
-dispatch init          # writes ~/.dispatch/env, edit it
-dispatch doctor        # checks logins, Twilio, your public URL
-dispatch start
+```bash
+curl -fsSL https://raw.githubusercontent.com/Futovia/dispatch/main/install.sh | bash
 ```
 
-Point the Twilio sender's inbound webhook at `https://<your host>/twilio/whatsapp`, then text the number.
+That installs Node 22 if needed, installs `@futovia/dispatch`, and runs `dispatch init`, which walks you through six steps:
 
-Run it for real with the user-level systemd unit in `deploy/dispatch.service` (no root needed) and a two-line reverse-proxy block like `deploy/Caddyfile.snippet`.
+1. **Claude login**: uses your Claude subscription (or `ANTHROPIC_API_KEY`). Claude Code does not even need to be installed first; dispatch ships with it.
+2. **Twilio account**: paste your Account SID and Auth Token (console.twilio.com, dashboard). Checked on the spot.
+3. **WhatsApp sender**: pick one of your Twilio WhatsApp numbers from the list, or the free Twilio sandbox to try it out.
+4. **Your number**: the only WhatsApp number allowed to drive the box.
+5. **How Twilio reaches the box**: a free Cloudflare tunnel (nothing to set up, the default) or your own https URL.
+6. **Done**: dispatch points your sender's webhook at itself, registers your Claude Code sessions, and installs itself as a service that survives reboots.
+
+Then text the number.
+
+Already have Node 22+? `npm install -g @futovia/dispatch && dispatch init` does the same.
+
+Running as root on a fresh VPS? The installer creates a normal user called `dispatch` (Claude Code will not run with full permissions as root), offers it passwordless sudo so the agent can install packages and fix system problems, and installs there.
+
+### What you need
+
+- A Linux or macOS box
+- A Claude subscription (Pro/Max) or an Anthropic API key
+- A Twilio account with a WhatsApp sender. The [Twilio sandbox](https://console.twilio.com/us1/develop/sms/try-it-out/whatsapp-learn) works for trying it out: text its join code from your phone first.
+
+### No questions asked
+
+Everything init asks can be passed as flags, for scripts and cloud-init:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Futovia/dispatch/main/install.sh | bash -s -- \
+  --sid ACxxxxxxxx --token xxxxxxxx --from +15551234567 --operator +447700900123 --url tunnel
+```
+
+Other flags: `--url https://your.host` instead of the tunnel, `--no-service`, `--no-hooks`, `--no-webhook`, `--shared-service` (allow repointing a Messaging Service that other numbers share).
 
 ## Talking to it
 
-Text what you want done. Anything that is not a command goes to the active agent, with your photos attached as files it can read.
+Text what you want done. Anything that is not a command goes to Claude, with your photos attached as files it can read.
 
 | command | what it does |
 |---|---|
-| `/new` | fresh session for the current agent |
-| `/claude`, `/codex` | switch agent; each keeps its own session |
+| `/new` | fresh session |
 | `/cd <folder>` | set the working folder (`/cd` shows it) |
-| `/status` | agent, folder, running job, load, memory, uptime |
+| `/status` | what is running, load, memory, uptime |
 | `/stop` | cancel the running job and clear the queue |
 | `/verbose` | narrate tool calls as they happen |
 | `/auto`, `/ask` | act freely, or ask you before every command and edit |
 | `/yes`, `/no` | answer an approval (plain "yes" / "no" works too) |
-| `/<cmd> <msg>` | send to the fallthrough bot, only if you set `DISPATCH_FALLTHROUGH_COMMAND` |
+| `/claude`, `/codex` | switch agent (Codex is optional: `dispatch enable-codex`) |
 
-The agent can text you mid-task from any script: `dispatch send "build green, deploying"`. Pipes work too: `make test 2>&1 | tail -5 | dispatch send`.
+One conversation, one job at a time: more texts queue behind it. The session is kept until you say `/new`, and it auto-compacts, so "what was that error yesterday" works.
 
-## Steering other sessions
+## Subtasks: spawning sessions
+
+The main conversation hands side jobs to fresh Claude Code sessions, each in its own folder, running in parallel:
+
+```
+you:       update the deps in ~/api and ~/web, and check disk space while you're at it
+dispatch:  started sessions in api and web. disk: 41% used on /, fine.
+dispatch:  *api* (new session 3f2a9c1e)
+           bumped 14 deps, tests green, committed 8e1d0b2.
+dispatch:  *web* (new session a71c44d0)
+           bumped 9 deps; next 15 needs a config change, did it, build passes.
+```
+
+Claude does this itself with `dispatch spawn`, and you can too, from any shell on the box:
+
+| command | what it does |
+|---|---|
+| `dispatch spawn <folder> "task"` | new Claude Code session in that folder; waits and prints the report |
+| `dispatch spawn <folder> "task" --bg` | returns at once; the report is texted to you when done |
+| `dispatch tell <folder> "..."` | continue that session later, with its full history |
+
+Up to `DISPATCH_MAX_SPAWNS` (default 4) run at once. Each is a normal Claude Code session: `claude --resume <id>` opens it in a terminal.
+
+## Commands on the box
+
+| command | what it does |
+|---|---|
+| `dispatch init` | guided setup (safe to rerun: keeps what you had) |
+| `dispatch doctor` | checks login, Twilio, webhook, tunnel, daemon, hooks; says what to fix |
+| `dispatch start` | run in the foreground |
+| `dispatch service install` | run as a service (systemd user unit / launchd); also `uninstall`, `status`, `logs` |
+| `dispatch send "text"` | text yourself from any script: `make test 2>&1 \| tail -5 \| dispatch send` |
+| `dispatch status` | what the daemon is doing right now |
+| `dispatch enable-codex` | add the optional Codex worker (`/codex`) |
+
+## Security, plainly
+
+- **Only your number gets in.** Every webhook's Twilio signature is checked against your auth token before anything is read; messages from any other number are ignored.
+- **It has your box.** By default (`/auto`) Claude runs with full permissions as the user dispatch runs as, like you at a terminal. That is the point. `/ask` makes it ask you on WhatsApp before every command and file edit.
+- **The tunnel is public, the daemon is not.** Only the webhook and a bare `{"ok":true}` health check answer from outside. Everything else needs a token that only processes running as you can read.
+- **Your secrets stay on the box**, in `~/.dispatch/env` (mode 600).
+
+The agent is as powerful as the user it runs as. Give it a user and sudo rights you are comfortable texting commands to.
+
+## The public URL
+
+`DISPATCH_PUBLIC_URL=tunnel` (the default) runs a free Cloudflare quick tunnel: no domain, no ports to open, no reverse proxy. Its URL changes whenever the tunnel restarts, and dispatch re-points your Twilio sender each time (`DISPATCH_AUTO_WEBHOOK`). Quick tunnels are best effort; for something you keep, give it a hostname:
+
+```
+# Caddyfile (Caddy gets the certificate itself)
+dispatch.example.com {
+  reverse_proxy 127.0.0.1:8790
+}
+```
+
+then `dispatch init --url https://dispatch.example.com`.
+
+With the Twilio sandbox, the webhook may have to be set by hand in the [sandbox settings](https://console.twilio.com/us1/develop/sms/try-it-out/whatsapp-learn) ("When a message comes in"); `dispatch doctor` tells you the URL.
+
+## Steering your other Claude Code sessions
 
 You usually have several Claude Code sessions open in terminals, one per project. Dispatch lets the WhatsApp thread act on any of them.
 
-Install the hooks once (they register every session with dispatch; nothing runs unless a session starts, prompts, stops or ends):
+`dispatch init` installs the hooks that register every session with dispatch (nothing runs unless a session starts, prompts, stops or ends). By hand, they are:
 
 ```json
 // ~/.claude/settings.json
@@ -105,14 +167,6 @@ The WhatsApp conversation gets the alert as context on your next message, so "pl
 
 WhatsApp lets a business reply freely for 24 hours after your last message. Outside that only an approved template gets through, and Twilio only reports the rejection asynchronously (error 63016 on the status callback). Dispatch handles both: it sends via the template up front when you have not texted for 23 hours, and resends via the template when a status callback reports 63016. Create a Content template with two variables ({{1}} machine name, {{2}} message), get it approved for WhatsApp as a UTILITY template, and set `DISPATCH_ALERT_TEMPLATE_SID`. Without one, alerts after a quiet day are dropped until you text the number.
 
-## Permissions
-
-`DISPATCH_PERMISSIONS=auto` (default): the agent has your box, same as you at a terminal. That is the point.
-
-`DISPATCH_PERMISSIONS=ask`: every command and file edit is relayed to your phone as a one-line summary; reply yes or no. Unanswered approvals are denied after `DISPATCH_APPROVAL_TIMEOUT_MIN`. Claude Code supports this natively. Codex has no approval hook, so in ask mode it runs in its workspace-write sandbox instead: writes stay inside the working folder.
-
-Switch at runtime with `/auto` and `/ask`.
-
 ## Sharing a number with an existing bot
 
 Already have a bot on that WhatsApp number? Set `DISPATCH_FALLTHROUGH_URL` to its webhook. Messages from anyone who is not an operator are re-signed with your Twilio auth token and forwarded, so the old bot cannot tell the difference. Operators reach it with `/fwd <message>` (rename the command with `DISPATCH_FALLTHROUGH_COMMAND`).
@@ -120,43 +174,46 @@ Already have a bot on that WhatsApp number? Set `DISPATCH_FALLTHROUGH_URL` to it
 ## Where things live
 
 ```
-~/.dispatch/env             all configuration
+~/.dispatch/env             all configuration (dispatch init writes it; every knob is documented inside)
 ~/.dispatch/DISPATCH.md     your instructions to the agent, appended to its system prompt
-~/.dispatch/state.json      operator settings, session ids, pending context (the agents keep the transcripts)
+~/.dispatch/state.json      operator settings, session ids, the local token
 ~/.dispatch/sessions/       one JSON per Claude Code session on the box, written by the hooks
 ~/.dispatch/transcripts/    one JSONL per operator; grep is the UI
-~/.dispatch/media/          photos and files you sent
+~/.dispatch/media/          photos you sent
+~/.dispatch/public-url      the current tunnel URL
 ```
 
 ## How it works
 
 ```
-WhatsApp -> Twilio -> https://host/twilio/whatsapp -> dispatch (127.0.0.1:8790)
-                                                         |
-                                     operator? ----no----+--> forward / ignore
-                                         |
-                                        yes
-                                         |
-                                 command? --yes--> /new /cd /status ...
-                                         |
-                                        no
-                                         |
-                              Claude Agent SDK  or  Codex SDK  (resumed session)
-                                         |
-                              markdown -> WhatsApp text, chunked -> Twilio -> phone
+WhatsApp -> Twilio -> https://<tunnel or host>/twilio/whatsapp -> dispatch (127.0.0.1:8790)
+                                                                     |
+                                              your number? ----no----+--> ignore / forward
+                                                   |
+                                                  yes
+                                                   |
+                                           command? --yes--> /new /cd /status ...
+                                                   |
+                                                  no
+                                                   |
+                                    Claude Agent SDK (resumed session)  --dispatch spawn-->  more sessions
+                                                   |
+                                    markdown -> WhatsApp text, chunked -> Twilio -> your phone
 ```
 
-Local routes (`/send`, `/alert`, `/tell`, `/sessions`) take a bearer token from state.json, so only processes running as you can use them. Twilio's signature is verified against the public URL before anything is parsed. Twilio retries webhooks that take longer than 15 seconds, so Dispatch acks immediately and works asynchronously; duplicate deliveries are dropped by message id. Outbound messages are capped at 1500 characters each and split at paragraph boundaries.
+Twilio retries webhooks that take longer than 15 seconds, so dispatch acks at once and works asynchronously; duplicate deliveries are dropped by message id. Replies are split into WhatsApp-sized messages at paragraph boundaries.
 
 ## Not built, on purpose (for now)
 
-Voice note transcription, group chats, multiple machines behind one number, a web UI, other messaging platforms. Open an issue if one of these is the thing standing between you and texting your server.
+Voice notes, group chats, several machines behind one number, a web UI, other messaging apps. Open an issue if one of these is the thing standing between you and texting your server.
 
 ## Development
 
 ```bash
-npm test          # vitest: signature, formatting, router with fake agents, session registry, alerts and tell
-npm run typecheck
+git clone https://github.com/Futovia/dispatch && cd dispatch
+npm install && npm run build
+npm test          # vitest: signatures, formatting, router with fake agents, sessions, spawn, setup
+npm link          # puts your checkout's `dispatch` on PATH
 ```
 
 MIT. Made by [Futovia](https://futovia.com).

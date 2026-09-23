@@ -44,6 +44,9 @@ export class ClaudeWorker implements Worker {
     const env = { ...process.env } as Record<string, string | undefined>;
     delete env.CLAUDECODE;
     delete env.CLAUDE_CODE_ENTRYPOINT;
+    // Claude Code refuses full permissions as root. The installer avoids root
+    // by creating a user; DISPATCH_ALLOW_ROOT=1 is the explicit opt-out.
+    if (process.getuid?.() === 0 && process.env.DISPATCH_ALLOW_ROOT) env.IS_SANDBOX = "1";
 
     let sessionId: string | undefined;
     let lastText = "";
@@ -62,7 +65,7 @@ export class ClaudeWorker implements Worker {
           abortController: ac,
           permissionMode: auto ? "bypassPermissions" : "default",
           allowDangerouslySkipPermissions: auto,
-          canUseTool,
+          canUseTool: auto ? undefined : canUseTool,
           systemPrompt: { type: "preset", preset: "claude_code", append: input.systemPrompt },
           settingSources: ["user", "project"],
           maxTurns: input.maxTurns,

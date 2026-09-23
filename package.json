@@ -1,26 +1,68 @@
 {
   "name": "@futovia/dispatch",
-  "version": "0.1.0",
-  "description": "Text your server. A WhatsApp (Twilio) front door that routes your messages to Claude Code and Codex running on your own box.",
-  "type": "module",
+  "version": "0.3.0",
+  "description": "Text your server. A one-command WhatsApp (Twilio) front door to Claude Code on your own box: it works the machine, spins up sessions for subtasks, and texts you back.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "whatsapp",
+    "twilio",
+    "agent",
+    "vps",
+    "devops",
+    "chatops"
+  ],
+  "homepage": "https://github.com/Futovia/dispatch#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Futovia/dispatch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Futovia/dispatch/issues"
+  },
   "license": "MIT",
-  "bin": { "dispatch": "./bin/dispatch.js" },
-  "engines": { "node": ">=22" },
+  "type": "module",
+  "bin": {
+    "dispatch": "./bin/dispatch.js"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "install.sh",
+    "deploy",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts start",
     "start": "node dist/cli.js start",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.263",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.263"
+  },
+  "peerDependencies": {
     "@openai/codex-sdk": "^0.153.4"
+  },
+  "peerDependenciesMeta": {
+    "@openai/codex-sdk": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "vitest": "^2.1.8",
+    "@openai/codex-sdk": "^0.153.4"
   }
 }
