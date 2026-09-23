@@ -3,7 +3,7 @@ import { join, resolve, basename } from "node:path";
 import { homedir, loadavg, freemem, totalmem } from "node:os";
 import type { Config, WorkerName, PermissionPolicy } from "./config.js";
 import type { State, OperatorState } from "./state.js";
-import { Sessions, stopProcess, sleep, type SessionRecord } from "./sessions.js";
+import { Sessions, stopProcess, sleep, sameModel, transcriptModel, type SessionRecord } from "./sessions.js";
 import type { Worker, ApprovalRequest, WorkerEvent } from "./workers/types.js";
 import { parseInbound, type InboundMessage } from "./twilio.js";
 import { buildSystemPrompt } from "./prompt.js";
@@ -25,6 +25,8 @@ export interface RouterDeps {
   forward: (params: Record<string, string>) => Promise<void>;
   /** Download inbound media; returns the bytes. */
   download: (url: string) => Promise<Buffer>;
+  /** Stop a `claude --bg` session through the daemon. Defaults to Sessions.stopBackground. */
+  stopBackground?: (rec: SessionRecord) => Promise<void>;
   now?: () => number;
 }
 
@@ -49,6 +51,8 @@ export interface TellJob {
   startedAt: number;
   ac: AbortController;
   mode: "resume" | "fork";
+  /** Model this run is pinned to; undefined means the CLI default decides. */
+  model?: string;
   done: Promise<TellResult>;
 }
 
@@ -58,6 +62,17 @@ export interface TellResult {
   sessionId?: string;
   mode: "resume" | "fork";
   ms: number;
+  /** Model the run was pinned to, or undefined when the CLI default decided. */
+  model?: string;
+  /** Why it forked or failed, for the operator. */
+  note?: string;
+}
+
+export interface TellOptions {
+  notify?: boolean;
+  force?: "resume" | "fork";
+  /** Override the configured model for this one instruction. */
+  model?: string;
 }
 
 export class TellError extends Error {
@@ -333,11 +348,16 @@ export class Router {
    * headlessly (one transcript, no branches). If it stays busy past the wait,
    * the transcript is forked instead so nothing in flight is lost.
    */
-  tell(targetRef: string, instruction: string, opts: { notify?: boolean; force?: "resume" | "fork" } = {}): TellJob {
+  tell(targetRef: string, instruction: string, opts: TellOptions = {}): TellJob {
     const { state, sessions } = this.deps;
     const own = state.ownSessionIds();
     const candidates = sessions.resolve(targetRef, own);
-    if (!candidates.length) throw new TellError(`no live terminal session matches "${targetRef}"`);
+    if (!candidates.length) {
+      const known = sessions.list({ exclude: own }).map((c) => `${basename(c.cwd)} ${c.id.slice(0, 8)}`).join(", ") || "none";
+      const msg = `no session matches "${targetRef}" (known: ${known})`;
+      void this.alert({ text: `dispatch tell failed: ${msg}\ninstruction: ${instruction.slice(0, 200)}` });
+      throw new TellError(msg);
+    }
     if (candidates.length > 1) {
       const names = candidates.map((c) => `${basename(c.cwd)} ${c.id.slice(0, 8)}`).join(", ");
       throw new TellError(`ambiguous: ${names}. use the session id.`, candidates);
@@ -346,44 +366,67 @@ export class Router {
     if (this.tells.has(target.id)) throw new TellError(`already running an instruction in ${basename(target.cwd)} (${target.id.slice(0, 8)})`);
     const ac = new AbortController();
     const id = `tell-${++this.tellSeq}`;
-    const job: TellJob = { id, target, instruction, startedAt: this.now(), ac, mode: opts.force ?? "resume", done: Promise.resolve() as unknown as Promise<TellResult> };
+    const model = opts.model ?? this.deps.config.claudeModel;
+    const job: TellJob = { id, target, instruction, startedAt: this.now(), ac, mode: opts.force ?? "resume", model, done: Promise.resolve() as unknown as Promise<TellResult> };
     job.done = this.runTell(job, opts).finally(() => this.tells.delete(target.id));
     this.tells.set(target.id, job);
     return job;
   }
 
-  private async runTell(job: TellJob, opts: { notify?: boolean; force?: "resume" | "fork" }): Promise<TellResult> {
+  private async runTell(job: TellJob, opts: TellOptions): Promise<TellResult> {
     const { config, state, sessions, workers } = this.deps;
     const target = job.target;
     const label = basename(target.cwd);
     const t0 = this.now();
 
     let mode: "resume" | "fork" = opts.force ?? "resume";
+    let note: string | undefined;
+    let cur = sessions.get(target.id) ?? target;
     if (!opts.force) {
-      // Wait for the terminal session to finish its turn, then take it over.
+      // Wait for the session to finish its turn, then take it over.
       const deadline = this.now() + config.tellIdleWaitMs;
-      let cur = sessions.get(target.id) ?? target;
       while (cur.state === "busy" && this.now() < deadline && !job.ac.signal.aborted) {
         await sleep(1000);
-        cur = sessions.get(target.id) ?? cur;
+        cur = sessions.list({ includeEnded: true }).find((r) => r.id === target.id) ?? cur;
       }
       if (cur.state === "busy") {
         mode = "fork";
+        note = `${label} was still mid-turn after ${Math.round(config.tellIdleWaitMs / 1000)}s, so this ran as a fork; the original session was left alone.`;
         log.info("tell: session still busy, forking", { session: target.id });
       }
     }
     job.mode = mode;
 
-    if (mode === "resume" && target.pid) {
-      const stopped = await stopProcess(target.pid);
-      if (!stopped) {
+    if (mode === "resume") {
+      // Same session id, one transcript: whatever is running it must be stopped first.
+      const stopped = await this.releaseSession(cur);
+      if (stopped.ok) {
+        if (stopped.how !== "nothing") {
+          sessions.update(target.id, { state: "taken", takenAt: new Date(this.now()).toISOString(), takenFor: job.instruction.slice(0, 200), pid: 0 });
+        }
+        if (stopped.how === "background") {
+          note = `${label} was a claude --bg session; dispatch stopped it and continued the same session id. Reopen it with: claude --resume ${target.id} (or claude attach ${cur.bgId ?? target.id.slice(0, 8)}).`;
+        } else if (stopped.how === "nothing") {
+          note = `${label} was not running; dispatch resumed its transcript headlessly. Reopen it with: claude --resume ${target.id}`;
+        }
+      } else {
         mode = "fork";
         job.mode = mode;
-        log.warn("tell: could not stop terminal process, forking", { pid: target.pid });
-      } else {
-        sessions.update(target.id, { state: "taken", takenAt: new Date(this.now()).toISOString(), takenFor: job.instruction.slice(0, 200), pid: 0 });
+        note = `could not stop ${label} (${stopped.error}); ran as a fork instead, original session untouched.`;
+        log.warn("tell: could not release session, forking", { session: target.id, err: stopped.error });
       }
     }
+
+    // Which model this runs on is never left to chance: dispatch passes its
+    // configured model (or the per-tell override) on resume and on fork. The
+    // transcript still remembers what the session itself last ran on, so a
+    // difference is reported instead of silently inherited.
+    const model = job.model;
+    const pinned = transcriptModel(cur.transcriptPath);
+    const modelNote =
+      pinned && model && !sameModel(pinned, model)
+        ? `${label}'s own transcript last ran on ${pinned}; dispatch ran this on ${model}.`
+        : undefined;
 
     const timeout = setTimeout(() => job.ac.abort(), config.tellTimeoutMs);
     let result: TellResult;
@@ -401,36 +444,72 @@ export class Router {
         signal: job.ac.signal,
         permissions: "auto",
         systemPrompt: buildSystemPrompt({ machineName: config.machineName, cwd: target.cwd, stateDir: config.stateDir }),
-        model: config.claudeModel,
+        model,
         maxTurns: config.maxTurns,
         onEvent: () => undefined,
         approve: async () => true,
       });
       let text = out.text.trim();
-      if (out.error === "aborted") text = "stopped before finishing.";
+      if (out.error === "aborted") text = job.ac.signal.aborted && this.now() - t0 >= config.tellTimeoutMs ? `stopped: hit the ${Math.round(config.tellTimeoutMs / 60000)} min tell timeout.` : "stopped before finishing.";
       else if (out.error && !text) text = `that did not go through: ${out.error}`;
       else if (out.error) text += `\n\n(ended with: ${out.error})`;
       if (out.sessionLost) text = `(could not resume session ${target.id.slice(0, 8)}, ran fresh in ${short(target.cwd)})\n\n${text}`;
       if (!text) text = "done. nothing to report.";
       if (out.sessionId && out.sessionId !== target.id) sessions.update(target.id, { continuedAs: out.sessionId });
-      result = { ok: !out.error, text, sessionId: out.sessionId ?? target.id, mode, ms: this.now() - t0 };
+      result = { ok: !out.error, text, sessionId: out.sessionId ?? target.id, mode, ms: this.now() - t0, model, note: joinNotes(note, modelNote) };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       log.error("tell crashed", { session: target.id, err: msg });
-      result = { ok: false, text: `crashed: ${msg}`, sessionId: target.id, mode, ms: this.now() - t0 };
+      result = { ok: false, text: `crashed: ${msg}`, sessionId: target.id, mode, ms: this.now() - t0, model, note: joinNotes(note, modelNote) };
     } finally {
       clearTimeout(timeout);
+    }
+
+    // A failed tell is a bug to fix, never something to work around quietly:
+    // the operator gets the exact error, and it lands in the root's context.
+    if (!result.ok) {
+      const ranOn = model ? model : "the CLI default (DISPATCH_CLAUDE_MODEL is not set)";
+      const was = pinned && (!model || !sameModel(pinned, model)) ? `\nsession last ran on: ${pinned}` : "";
+      const hint = isLimitError(result.text)
+        ? `\nthat is a usage limit on ${ranOn}: pick another model with DISPATCH_CLAUDE_MODEL in ~/.dispatch/env (restart dispatch), or retry with dispatch tell --model <name>.`
+        : "";
+      await this.alert({
+        text: `dispatch tell failed for ${label} (${target.id.slice(0, 8)}, ${mode})\nmodel: ${ranOn}${was}\ninstruction: ${job.instruction.slice(0, 200)}\nerror: ${result.text.slice(0, 1200)}${hint}`,
+      });
     }
 
     const at = new Date(this.now()).toISOString().slice(11, 16);
     for (const op of config.operators) {
       this.operator(op);
-      state.addNote(op, `${at} you told ${label} (${target.id.slice(0, 8)}, ${mode}): "${job.instruction.slice(0, 160)}" -> ${result.text.slice(0, 400)}`);
-      state.transcript(op, { dir: "tell", session: target.id, cwd: target.cwd, mode, instruction: job.instruction, text: result.text, ms: result.ms });
-      if (opts.notify ?? true) await this.say(op, `*${label}*\n${result.text}`);
+      state.addNote(op, `${at} you told ${label} (${target.id.slice(0, 8)}, ${mode}${result.ok ? "" : ", FAILED"}): "${job.instruction.slice(0, 160)}" -> ${result.text.slice(0, 400)}${result.note ? ` [${result.note}]` : ""}`);
+      state.transcript(op, { dir: "tell", session: target.id, cwd: target.cwd, mode, model, ok: result.ok, note: result.note, instruction: job.instruction, text: result.text, ms: result.ms });
+      if ((opts.notify ?? true) && result.ok) await this.say(op, `*${label}*${mode === "fork" ? " (fork)" : ""}\n${result.text}${result.note ? `\n\n_${result.note}_` : ""}`);
     }
-    log.info("tell done", { session: target.id, mode, ms: result.ms, ok: result.ok });
+    log.info("tell done", { session: target.id, mode, model: model ?? "cli-default", ms: result.ms, ok: result.ok });
     return result;
+  }
+
+  /**
+   * Make a session's transcript free to resume under the same id: stop the
+   * terminal process, or ask the daemon to stop a `claude --bg` session. A
+   * session with no process (taken or ended) needs nothing.
+   */
+  private async releaseSession(rec: SessionRecord): Promise<{ ok: true; how: "terminal" | "background" | "nothing" } | { ok: false; error: string }> {
+    const { sessions } = this.deps;
+    const agent = sessions.agents().find((a) => a.sessionId === rec.id);
+    const isBackground = rec.kind === "background" || agent?.kind === "background";
+    if (isBackground) {
+      try {
+        await (this.deps.stopBackground ?? ((r) => sessions.stopBackground(r)))({ ...rec, bgId: rec.bgId ?? agent?.id });
+        return { ok: true, how: "background" };
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    }
+    const pid = rec.pid || agent?.pid || 0;
+    if (!pid) return { ok: true, how: "nothing" };
+    if (await stopProcess(pid)) return { ok: true, how: "terminal" };
+    return { ok: false, error: `process ${pid} did not exit on SIGTERM/SIGKILL` };
   }
 
   stopTell(sessionId: string): boolean {
@@ -590,6 +669,17 @@ export class Router {
       log.error("send failed", { to, err: e instanceof Error ? e.message : String(e) });
     }
   }
+}
+
+/** Everything the operator should know about how the tell ran, in one line. */
+function joinNotes(...parts: Array<string | undefined>): string | undefined {
+  const out = parts.filter((p): p is string => Boolean(p && p.trim())).join(" ");
+  return out || undefined;
+}
+
+/** A model/usage limit rather than a bug in the instruction: the fix is a different model. */
+function isLimitError(text: string): boolean {
+  return /\b(limit|quota|usage credits?|out of credits?)\b/i.test(text);
 }
 
 function short(p: string): string {

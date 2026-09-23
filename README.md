@@ -91,8 +91,13 @@ Then, from any session or script:
 | `dispatch sessions` | live terminal sessions: id, idle/busy, folder, last prompt |
 | `dispatch tell perfit-app "merge the pr"` | run the instruction inside that session's conversation and print the result |
 | `dispatch tell <id> "..." --bg` | return at once; the result is texted when it finishes |
+| `dispatch tell <id> "..." --model opus` | run this one instruction on a named model |
 
-What happens on `tell`: dispatch waits for the target to finish its current turn (up to `DISPATCH_TELL_IDLE_WAIT_SEC`), stops its terminal process (the transcript is already on disk), and resumes the same session id headlessly with your instruction. One transcript, no branches; `claude --resume <id>` in a terminal later shows everything. If the session stays busy it forks the transcript instead and leaves the terminal alone.
+What happens on `tell`: dispatch waits for the target to finish its current turn (up to `DISPATCH_TELL_IDLE_WAIT_SEC`), stops whatever is running it (a terminal process gets SIGTERM; a `claude --bg` session is stopped through the daemon with `claude stop`, which keeps its conversation), and resumes the same session id headlessly with your instruction. One transcript, no branches; `claude --resume <id>` in a terminal later shows everything. If the session stays busy, or cannot be stopped, it forks the transcript instead, leaves the original alone, and labels the result as a fork with the reason. A session with no process left (ended, or already taken) is still a target: its transcript is resumed with nothing to stop.
+
+Which model a `tell` runs on is never left to the CLI's default: dispatch passes `DISPATCH_CLAUDE_MODEL` explicitly, on resume and on fork alike, and `--model <name>` overrides it for a single instruction. If the target session's own transcript last ran on a different model, the result says so instead of leaving you to guess. When a run dies on a usage limit, the alert names the model it was running on and how to change it.
+
+The registry is the hooks plus `claude agents --json`, the CLI's own list of interactive and background sessions. A session only counts as gone when its process is dead and the CLI no longer lists it; a failed resume never drops one. Every failed `tell` is texted to you with the exact error, so it gets fixed instead of worked around.
 
 The WhatsApp conversation gets the alert as context on your next message, so "pls merge" after a "pr done" alert from perfit-app is routed into that session by the agent itself, using `dispatch tell`. If two sessions could match, it asks which.
 

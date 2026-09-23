@@ -141,21 +141,22 @@ export function createDispatchServer(deps: ServerDeps): Server {
     const waitMs = typeof parsed.waitMs === "number" ? Math.max(0, parsed.waitMs) : 0;
     const force = parsed.mode === "fork" || parsed.mode === "resume" ? parsed.mode : undefined;
     const notify = parsed.notify !== false;
+    const model = typeof parsed.model === "string" && parsed.model.trim() ? parsed.model.trim() : undefined;
     let job;
     try {
-      job = deps.router.tell(target || "latest", instruction, { notify, force });
+      job = deps.router.tell(target || "latest", instruction, { notify, force, model });
     } catch (e) {
       if (e instanceof TellError) {
         return json(res, 409, { error: e.message, candidates: e.candidates.map((c) => ({ id: c.id, cwd: c.cwd, state: c.state })) });
       }
       throw e;
     }
-    const started = { id: job.id, session: job.target.id, cwd: job.target.cwd };
+    const started = { id: job.id, session: job.target.id, cwd: job.target.cwd, model: job.model };
     if (!waitMs) return json(res, 202, { ok: true, started: true, ...started });
     const timer = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), waitMs));
     const outcome = await Promise.race([job.done, timer]);
     if (outcome === "timeout") return json(res, 202, { ok: true, started: true, stillRunning: true, ...started });
-    json(res, 200, { ok: outcome.ok, done: true, ...started, mode: outcome.mode, text: outcome.text, ms: outcome.ms, sessionId: outcome.sessionId });
+    json(res, 200, { ok: outcome.ok, done: true, ...started, mode: outcome.mode, model: outcome.model, text: outcome.text, ms: outcome.ms, sessionId: outcome.sessionId, note: outcome.note });
   }
 
   async function status(req: IncomingMessage, res: ServerResponse): Promise<void> {

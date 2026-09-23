@@ -13,6 +13,7 @@ const USAGE = `dispatch - text your server.
   dispatch tell <target> "text"    run an instruction inside one of those sessions
                                    target: folder name, path, session id prefix, or "latest"
                                    --bg (return at once, result is texted) --fork --resume --timeout <min>
+                                   --model <name> (default: DISPATCH_CLAUDE_MODEL)
   dispatch hook                    Claude Code hook entry point (reads the hook JSON on stdin)
   dispatch status                  what the running daemon is doing
   dispatch doctor                  check logins, config, Twilio, public URL
@@ -269,6 +270,7 @@ async function sessions(): Promise<void> {
     const line = [
       id.slice(0, 8),
       String(s.state).padEnd(5),
+      s.kind === "background" ? `bg:${String(s.bgId ?? id.slice(0, 8))}` : "term",
       String(s.cwd),
       s.lastPrompt ? `"${String(s.lastPrompt).slice(0, 60)}"` : "",
       s.takenFor ? `(taken: ${String(s.takenFor).slice(0, 40)})` : "",
@@ -284,6 +286,7 @@ async function tell(args: string[]): Promise<void> {
   let bg = false;
   let mode: "fork" | "resume" | undefined;
   let timeoutMin = 10;
+  let model: string | undefined;
   const positional: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
@@ -291,16 +294,18 @@ async function tell(args: string[]): Promise<void> {
     else if (a === "--fork") mode = "fork";
     else if (a === "--resume") mode = "resume";
     else if (a === "--timeout") timeoutMin = Number(args[++i] ?? "10") || 10;
+    else if (a === "--model") model = args[++i];
+    else if (a.startsWith("--model=")) model = a.slice("--model=".length);
     else positional.push(a);
   }
   const [target, ...restWords] = positional;
   let instruction = restWords.join(" ").trim();
   if (!instruction && !process.stdin.isTTY) instruction = readFileSync(0, "utf8").trim();
   if (!target || !instruction) {
-    process.stderr.write('usage: dispatch tell <folder|session-id|latest> "instruction" [--bg] [--fork|--resume] [--timeout <min>]\n');
+    process.stderr.write('usage: dispatch tell <folder|session-id|latest> "instruction" [--bg] [--fork|--resume] [--timeout <min>] [--model <name>]\n');
     process.exit(2);
   }
-  const { status, json } = await call("/tell", { target, instruction, waitMs: bg ? 0 : timeoutMin * 60_000, mode });
+  const { status, json } = await call("/tell", { target, instruction, waitMs: bg ? 0 : timeoutMin * 60_000, mode, model });
   if (status === 409) {
     process.stderr.write(`dispatch tell: ${String(json.error)}\n`);
     const cands = (json.candidates as Array<Record<string, unknown>>) ?? [];
@@ -313,7 +318,9 @@ async function tell(args: string[]): Promise<void> {
   }
   const where = `${basename(String(json.cwd))} (${String(json.session).slice(0, 8)})`;
   if (json.done) {
-    process.stdout.write(`[${where}, ${String(json.mode)}, ${Math.round(Number(json.ms) / 1000)}s]\n${String(json.text)}\n`);
+    const note = typeof json.note === "string" && json.note ? `\nnote: ${json.note}` : "";
+    const on = typeof json.model === "string" && json.model ? `, ${json.model}` : "";
+    process.stdout.write(`[${where}, ${String(json.mode)}${on}, ${Math.round(Number(json.ms) / 1000)}s${json.ok ? "" : ", FAILED"}]\n${String(json.text)}${note}\n`);
     process.exit(json.ok ? 0 : 1);
   }
   process.stdout.write(

@@ -1,11 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Router } from "../src/router.js";
 import { State } from "../src/state.js";
-import { Sessions } from "../src/sessions.js";
+import { Sessions, type AgentInfo, type SessionRecord } from "../src/sessions.js";
+
+let agentsList: AgentInfo[] = [];
 import type { Config } from "../src/config.js";
 import type { Worker, WorkerRunInput, WorkerResult } from "../src/workers/types.js";
 
@@ -61,7 +63,7 @@ describe("Router", () => {
   function make(overrides: Partial<Config> = {}) {
     const cfg = config(dir, overrides);
     const state = new State(dir);
-    const sessions = new Sessions(dir);
+    const sessions = new Sessions(dir, { agents: () => agentsList });
     const router = new Router({
       config: cfg,
       state,
@@ -265,11 +267,13 @@ describe("Router: alerts and tell", () => {
   let sent: Array<{ to: string; text: string }>;
   let claude: FakeWorker;
   let codex: FakeWorker;
+  let stoppedBg: SessionRecord[];
+  let stopBgFails: string | undefined;
 
   function make(overrides: Partial<Config> = {}) {
     const cfg = config(dir, overrides);
     const state = new State(dir);
-    const sessions = new Sessions(dir);
+    const sessions = new Sessions(dir, { agents: () => agentsList });
     const router = new Router({
       config: cfg,
       state,
@@ -280,6 +284,11 @@ describe("Router: alerts and tell", () => {
       },
       forward: async () => undefined,
       download: async () => Buffer.from("img"),
+      stopBackground: async (rec) => {
+        if (stopBgFails) throw new Error(stopBgFails);
+        stoppedBg.push(rec);
+        agentsList = agentsList.filter((a) => a.sessionId !== rec.id);
+      },
     });
     return { router, state, sessions };
   }
@@ -294,6 +303,9 @@ describe("Router: alerts and tell", () => {
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "dispatch-test-"));
     sent = [];
+    agentsList = [];
+    stoppedBg = [];
+    stopBgFails = undefined;
     claude = new FakeWorker("claude");
     codex = new FakeWorker("codex");
   });
@@ -384,8 +396,194 @@ describe("Router: alerts and tell", () => {
     state.operator(OP, { worker: "claude", cwd: dir });
     state.setSession(OP, "claude", "root-1");
     expect(() => router.tell("a-", "x")).toThrow(/ambiguous/);
-    expect(() => router.tell("nope", "x")).toThrow(/no live terminal session/);
-    expect(() => router.tell("root-1", "x")).toThrow(/no live terminal session/);
+    expect(() => router.tell("nope", "x")).toThrow(/no session matches/);
+    expect(() => router.tell("root-1", "x")).toThrow(/no session matches/);
     expect(router.listSessions().map((s) => s.id).sort()).toEqual(["a-1", "a-2"]);
+  });
+
+  it("tell: a claude --bg session is stopped through the daemon, then resumed under the same id, with a clear note", async () => {
+    const { router, sessions, state } = make();
+    const cwd = join(dir, "perfit-scoping");
+    const ts = new Date().toISOString();
+    // Registered by hooks with pid 0 (the bg process tree), listed by the CLI as a background session.
+    sessions.put({ id: "bc1653c0-1111", cwd, pid: 0, state: "idle", startedAt: ts, updatedAt: ts });
+    agentsList = [{ sessionId: "bc1653c0-1111", kind: "background", cwd, id: "bc1653c0", pid: 4242, state: "idle" }];
+    claude.reply = async (i) => ({ text: "ok", sessionId: i.resume });
+
+    const result = await router.tell("perfit-scoping", "reply with ok").done;
+    expect(result.ok).toBe(true);
+    expect(result.mode).toBe("resume");
+    expect(stoppedBg.map((r) => r.bgId)).toEqual(["bc1653c0"]);
+    expect(claude.calls[0]).toMatchObject({ resume: "bc1653c0-1111", fork: false, cwd });
+    expect(result.note).toMatch(/claude --bg session; dispatch stopped it/);
+    expect(result.note).toContain("claude --resume bc1653c0-1111");
+    expect(sessions.get("bc1653c0-1111")).toMatchObject({ state: "taken", kind: "background", bgId: "bc1653c0" });
+    expect(sent[0]!.text).toContain("ok");
+    expect(sent[0]!.text).toContain("claude --bg session");
+    expect(state.takeNotes(OP)[0]).toContain("bc1653c0");
+  });
+
+  it("tell: when the daemon refuses to stop a --bg session it forks, says so, and never fakes a resume", async () => {
+    const { router, sessions } = make();
+    const cwd = join(dir, "perfit-scoping");
+    const ts = new Date().toISOString();
+    sessions.put({ id: "bc1653c0-1111", cwd, pid: 0, state: "idle", startedAt: ts, updatedAt: ts });
+    agentsList = [{ sessionId: "bc1653c0-1111", kind: "background", cwd, id: "bc1653c0", pid: 4242, state: "idle" }];
+    stopBgFails = "claude stop bc1653c0 failed: daemon unreachable";
+    claude.reply = async () => ({ text: "ok", sessionId: "bc1653c0-fork" });
+
+    const result = await router.tell("bc1653c0", "reply with ok").done;
+    expect(result.ok).toBe(true);
+    expect(result.mode).toBe("fork");
+    expect(result.note).toContain("daemon unreachable");
+    expect(claude.calls[0]).toMatchObject({ resume: "bc1653c0-1111", fork: true });
+    expect(sessions.get("bc1653c0-1111")).toMatchObject({ state: "idle", continuedAs: "bc1653c0-fork" });
+    expect(sent[0]!.text).toMatch(/\(fork\)/);
+  });
+
+  it("registry: a failed resume never drops a live session, and the CLI listing keeps it resolvable", async () => {
+    const { router, sessions } = make();
+    const cwd = join(dir, "perfit-scoping");
+    const ts = new Date().toISOString();
+    sessions.put({ id: "bc1653c0-1111", cwd, pid: 0, state: "idle", startedAt: ts, updatedAt: ts });
+    agentsList = [{ sessionId: "bc1653c0-1111", kind: "background", cwd, id: "bc1653c0", pid: 4242, state: "idle" }];
+    // The CLI rejects the resume (what happened on 2026-09-14), and its own hooks
+    // fire from the headless process: SessionStart, then SessionEnd.
+    claude.reply = async () => {
+      sessions.applyHook({ hook_event_name: "SessionStart", session_id: "bc1653c0-1111", cwd }, process.pid);
+      sessions.applyHook({ hook_event_name: "SessionEnd", session_id: "bc1653c0-1111", cwd }, process.pid);
+      return { text: "", error: "Claude Code process exited with code 1. stderr: Error: Session bc1653c0-1111 is running as a background session (bc1653c0)." };
+    };
+    // Simulate the daemon keeping the session alive despite our stop request.
+    agentsList = [{ sessionId: "bc1653c0-1111", kind: "background", cwd, id: "bc1653c0", pid: 4242, state: "idle" }];
+    const keepAlive = agentsList;
+    const first = await router.tell("bc1653c0", "reply with ok").done;
+    agentsList = keepAlive;
+    expect(first.ok).toBe(false);
+
+    // Still there, still resolvable by id, folder and bgId; a second tell reaches it.
+    expect(sessions.resolve("bc1653c0").map((r) => r.id)).toEqual(["bc1653c0-1111"]);
+    expect(sessions.resolve("perfit-scoping").map((r) => r.id)).toEqual(["bc1653c0-1111"]);
+    expect(sessions.list().find((r) => r.id === "bc1653c0-1111")?.state).not.toBe("ended");
+    claude.reply = async (i) => ({ text: "ok", sessionId: i.resume });
+    const second = await router.tell("bc1653c0", "reply with ok", { force: "fork" }).done;
+    expect(second.ok).toBe(true);
+  });
+
+  it("registry: an ended transcript with no process is still a valid tell target, resumed with nothing to stop", async () => {
+    const { router, sessions } = make();
+    const cwd = join(dir, "crm");
+    const ts = new Date().toISOString();
+    sessions.put({ id: "c5d3e503-2222", cwd, pid: 0, state: "ended", startedAt: ts, updatedAt: ts });
+    claude.reply = async (i) => ({ text: "ok", sessionId: i.resume });
+    const result = await router.tell("crm", "reply with ok").done;
+    expect(result).toMatchObject({ ok: true, mode: "resume" });
+    expect(result.note).toContain("was not running");
+    expect(claude.calls[0]).toMatchObject({ resume: "c5d3e503-2222", fork: false });
+  });
+
+  it("tell: pins the configured model on resume and on fork, and a per-tell model wins", async () => {
+    const { router, sessions } = make({ claudeModel: "opus" });
+    const ts = new Date().toISOString();
+    sessions.put({ id: "perfit-abc", cwd: join(dir, "perfit-app"), pid: 0, state: "idle", startedAt: ts, updatedAt: ts });
+    sessions.put({ id: "crm-222", cwd: join(dir, "crm"), pid: 0, state: "idle", startedAt: ts, updatedAt: ts });
+    claude.reply = async (i) => ({ text: "ok", sessionId: i.resume });
+
+    const resumed = await router.tell("perfit-app", "reply with ok", { notify: false }).done;
+    expect(claude.calls[0]).toMatchObject({ resume: "perfit-abc", fork: false, model: "opus" });
+    expect(resumed.model).toBe("opus");
+
+    const forked = await router.tell("crm", "reply with ok", { notify: false, force: "fork" }).done;
+    expect(claude.calls[1]).toMatchObject({ resume: "crm-222", fork: true, model: "opus" });
+    expect(forked.model).toBe("opus");
+
+    const override = await router.tell("crm", "reply with ok", { notify: false, model: "sonnet" }).done;
+    expect(claude.calls[2]!.model).toBe("sonnet");
+    expect(override.model).toBe("sonnet");
+  });
+
+  it("tell: with no model configured, nothing is forced and the CLI default decides", async () => {
+    const { router, sessions } = make();
+    const ts = new Date().toISOString();
+    sessions.put({ id: "crm-222", cwd: join(dir, "crm"), pid: 0, state: "idle", startedAt: ts, updatedAt: ts });
+    claude.reply = async (i) => ({ text: "ok", sessionId: i.resume });
+    const result = await router.tell("crm", "reply with ok", { notify: false }).done;
+    expect(claude.calls[0]!.model).toBeUndefined();
+    expect(result.model).toBeUndefined();
+  });
+
+  it("tell: says so when the target session's transcript last ran on another model", async () => {
+    const { router, sessions } = make({ claudeModel: "opus" });
+    const ts = new Date().toISOString();
+    const transcriptPath = join(dir, "bc1653c0.jsonl");
+    writeFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { model: "claude-fable-5-1", content: [] } }) + "\n");
+    sessions.put({ id: "bc1653c0-1111", cwd: join(dir, "perfit-scoping"), pid: 0, state: "idle", startedAt: ts, updatedAt: ts, transcriptPath });
+    claude.reply = async (i) => ({ text: "ok", sessionId: i.resume });
+
+    const result = await router.tell("perfit-scoping", "reply with ok").done;
+    expect(result.ok).toBe(true);
+    expect(claude.calls[0]!.model).toBe("opus");
+    expect(result.note).toContain("last ran on claude-fable-5-1");
+    expect(result.note).toContain("dispatch ran this on opus");
+    expect(sent[0]!.text).toContain("claude-fable-5-1");
+
+    // Same family, different spelling: nothing to report.
+    writeFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { model: "claude-opus-5", content: [] } }) + "\n");
+    sent.length = 0;
+    const quiet = await router.tell("perfit-scoping", "again").done;
+    expect(quiet.note ?? "").not.toMatch(/last ran on/);
+  });
+
+  it("failure: a model limit error names the model it ran on and how to change it", async () => {
+    const { router, sessions } = make({ claudeModel: "fable" });
+    const ts = new Date().toISOString();
+    const transcriptPath = join(dir, "sc.jsonl");
+    writeFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { model: "claude-fable-5-1", content: [] } }) + "\n");
+    sessions.put({ id: "bc1653c0-1111", cwd: join(dir, "perfit-scoping"), pid: 0, state: "idle", startedAt: ts, updatedAt: ts, transcriptPath });
+    claude.reply = async () => ({ text: "", error: "Claude Code returned an error result: You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai/settings/usage to continue." });
+
+    const result = await router.tell("perfit-scoping", "run the cadence").done;
+    expect(result.ok).toBe(false);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.text).toContain("model: fable");
+    expect(sent[0]!.text).toContain("usage limit on fable");
+    expect(sent[0]!.text).toContain("DISPATCH_CLAUDE_MODEL");
+  });
+
+  it("failure: with no model configured the alert says the CLI default picked it, and what the session last used", async () => {
+    const { router, sessions } = make();
+    const ts = new Date().toISOString();
+    const transcriptPath = join(dir, "sc2.jsonl");
+    writeFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { model: "claude-fable-5-1", content: [] } }) + "\n");
+    sessions.put({ id: "aaaa-1", cwd: join(dir, "perfit-scoping"), pid: 0, state: "idle", startedAt: ts, updatedAt: ts, transcriptPath });
+    claude.reply = async () => ({ text: "", error: "You've reached your Fable limit." });
+
+    const result = await router.tell("perfit-scoping", "run it").done;
+    expect(result.ok).toBe(false);
+    expect(sent[0]!.text).toContain("DISPATCH_CLAUDE_MODEL is not set");
+    expect(sent[0]!.text).toContain("session last ran on: claude-fable-5-1");
+  });
+
+  it("failure: any tell that errors texts the operator the exact error and records it as context", async () => {
+    const { router, sessions, state } = make();
+    const cwd = join(dir, "perfit-scoping");
+    const p = liveProcess();
+    const ts = new Date().toISOString();
+    sessions.put({ id: "aaaa-1", cwd, pid: p.pid!, state: "idle", startedAt: ts, updatedAt: ts });
+    const stderr = "Claude Code process exited with code 1. stderr: Error: Session aaaa-1 is running as a background session (aaaa). Run claude attach aaaa";
+    claude.reply = async () => ({ text: "", error: stderr });
+    const result = await router.tell("perfit-scoping", "merge it").done;
+    expect(result.ok).toBe(false);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.text).toContain("dispatch tell failed for perfit-scoping");
+    expect(sent[0]!.text).toContain(stderr);
+    expect(sent[0]!.text).toContain("merge it");
+    expect(state.takeNotes(OP).join("\n")).toContain("FAILED");
+
+    // No match is loud too.
+    sent.length = 0;
+    expect(() => router.tell("nothing-like-this", "x")).toThrow(/no session matches/);
+    await tick();
+    expect(sent[0]!.text).toContain('dispatch tell failed: no session matches "nothing-like-this"');
   });
 });
