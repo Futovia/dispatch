@@ -30,6 +30,7 @@ function config(dir: string, overrides: Partial<Config> = {}): Config {
     maxTurns: 10,
     jobTimeoutMs: 60_000,
     approvalTimeoutMs: 1_000,
+    debounceMs: 0,
     machineName: "testbox",
     tellIdleWaitMs: 200,
     tellTimeoutMs: 10_000,
@@ -116,8 +117,8 @@ describe("Router", () => {
     let release!: () => void;
     claude.reply = (i) =>
       new Promise((resolve) => {
-        if (i.prompt === "slow") release = () => resolve({ text: "slow done" });
-        else resolve({ text: `echo: ${i.prompt}` });
+        if (i.prompt === "slow") release = () => resolve({ text: "slow done", sessionId: "s1" });
+        else resolve({ text: `echo: ${i.prompt}`, sessionId: "s1" });
       });
     await router.handleWebhook(inbound(OP, "slow"));
     await tick();
@@ -154,7 +155,8 @@ describe("Router", () => {
     await router.handleWebhook(inbound(OP, "/codex"));
     await router.handleWebhook(inbound(OP, "two"));
     await tick();
-    expect(codex.calls[0]!.prompt).toBe("two");
+    // codex has no session yet, so it is caught up on what claude was told
+    expect(codex.calls[0]!.prompt).toMatch(/^\[This is a new session\.[^\n]*\]\noperator \([^)]*\): one\nyou \([^)]*\): echo: one\n\n\[The operator's new message:\]\ntwo$/);
     await router.handleWebhook(inbound(OP, "/claude"));
     expect(sent.at(-1)!.text).toBe("switched to claude, resuming your last session.");
     await router.handleWebhook(inbound(OP, "three"));
@@ -249,6 +251,111 @@ describe("Router", () => {
     await tick();
     expect(claude.calls[0]!.images).toHaveLength(1);
     expect(claude.calls[0]!.images[0]).toMatch(/\.jpg$/);
+  });
+
+  describe("debounce", () => {
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    it("runs a burst of texts as one batch once they stop, each text restarting the wait", async () => {
+      const { router } = make({ debounceMs: 80 });
+      await router.handleWebhook(inbound(OP, "one"));
+      await wait(50);
+      await router.handleWebhook(inbound(OP, "two"));
+      await wait(50);
+      await router.handleWebhook(inbound(OP, "three"));
+      await wait(50);
+      expect(claude.calls).toHaveLength(0); // 150ms since the first text, but only 50 since the last
+      expect(sent).toEqual([]); // no chatter while waiting
+      await wait(60);
+      expect(claude.calls).toHaveLength(1);
+      expect(claude.calls[0]!.prompt).toBe("one\n\ntwo\n\nthree");
+      expect(sent.map((x) => x.text)).toEqual(["echo: one\n\ntwo\n\nthree"]);
+    });
+
+    it("/go starts at once, /status shows what is waiting", async () => {
+      const { router } = make({ debounceMs: 60_000 });
+      await router.handleWebhook(inbound(OP, "deploy it"));
+      await router.handleWebhook(inbound(OP, "/status"));
+      expect(sent.at(-1)!.text).toMatch(/waiting: 1 text, starting in \d+m/);
+      await router.handleWebhook(inbound(OP, "/go"));
+      await tick();
+      expect(claude.calls.map((c) => c.prompt)).toEqual(["deploy it"]);
+      expect(router.snapshot().queued).toEqual([]);
+      await router.handleWebhook(inbound(OP, "/go"));
+      expect(sent.at(-1)!.text).toBe("nothing waiting.");
+    });
+
+    it("/stop drops texts that are still waiting", async () => {
+      const { router } = make({ debounceMs: 40 });
+      await router.handleWebhook(inbound(OP, "never mind this"));
+      await router.handleWebhook(inbound(OP, "/stop"));
+      expect(sent.at(-1)!.text).toBe("cleared 1 queued.");
+      await wait(70);
+      expect(claude.calls).toHaveLength(0);
+    });
+
+    it("texts sent during a job wait out their own quiet period after it", async () => {
+      const { router } = make({ debounceMs: 60 });
+      let release!: () => void;
+      claude.reply = (i) =>
+        new Promise((resolve) => {
+          if (i.prompt === "slow") release = () => resolve({ text: "slow done", sessionId: "s1" });
+          else resolve({ text: `echo: ${i.prompt}`, sessionId: "s1" });
+        });
+      await router.handleWebhook(inbound(OP, "slow"));
+      await wait(80);
+      await router.handleWebhook(inbound(OP, "and also"));
+      expect(sent.map((x) => x.text)).toEqual(["got it, queued behind the current task. /stop to cancel that one."]);
+      release();
+      await tick();
+      expect(claude.calls).toHaveLength(1); // "and also" arrived <60ms ago
+      await wait(80);
+      expect(claude.calls.map((c) => c.prompt)).toEqual(["slow", "and also"]);
+    });
+
+    it("waiting texts survive a restart and run when their window closes", async () => {
+      const first = make({ debounceMs: 60_000 });
+      await first.router.handleWebhook(inbound(OP, "survive me"));
+      expect(claude.calls).toHaveLength(0);
+      // a new daemon on the same state dir, with a shorter window that has already passed
+      const second = make({ debounceMs: 1 });
+      second.router.resumePending();
+      await wait(20);
+      expect(claude.calls.map((c) => c.prompt)).toEqual(["survive me"]);
+    });
+  });
+
+  describe("history", () => {
+    it("catches a fresh session up on the conversation, but not past /new", async () => {
+      const { router, state } = make();
+      await router.handleWebhook(inbound(OP, "the db is postgres 16"));
+      await tick();
+      claude.reply = async (i) => ({ text: `echo: ${i.prompt}`, sessionId: "claude-new", sessionLost: true });
+      // the session vanished: the next run starts fresh and has to be told what came before
+      state.setSession(OP, "claude", undefined);
+      await router.handleWebhook(inbound(OP, "which db again?"));
+      await tick();
+      expect(claude.calls[1]!.prompt).toContain("operator (");
+      expect(claude.calls[1]!.prompt).toContain("): the db is postgres 16");
+      expect(claude.calls[1]!.prompt).toMatch(/\[The operator's new message:\]\nwhich db again\?$/);
+
+      await router.handleWebhook(inbound(OP, "/new"));
+      await router.handleWebhook(inbound(OP, "clean slate"));
+      await tick();
+      expect(claude.calls[2]!.prompt).toBe("clean slate");
+    });
+
+    it("keeps every message in history.db across sessions", async () => {
+      const { router, state } = make();
+      await router.handleWebhook(inbound(OP, "first"));
+      await tick();
+      await router.handleWebhook(inbound(OP, "/new"));
+      await router.handleWebhook(inbound(OP, "second"));
+      await tick();
+      const rows = state.history.recent({ operator: OP }).map((e) => `${e.dir}:${e.text}`);
+      expect(rows).toEqual(["in:first", "out:echo: first", "in:/new", "reset:", "in:second", "out:echo: second"]);
+      expect(state.history.recent({ search: "seco" }).map((e) => e.text)).toEqual(["second", "echo: second"]);
+    });
   });
 
   it("starts fresh when the worker reports the session was lost", async () => {

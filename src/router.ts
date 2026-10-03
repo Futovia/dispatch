@@ -7,6 +7,7 @@ import { Sessions, stopProcess, sleep, sameModel, transcriptModel, type SessionR
 import type { Worker, ApprovalRequest, WorkerEvent } from "./workers/types.js";
 import { parseInbound, type InboundMessage } from "./twilio.js";
 import { buildSystemPrompt } from "./prompt.js";
+import { RESET, type PendingMessage } from "./history.js";
 import { log } from "./log.js";
 
 /**
@@ -112,13 +113,17 @@ export class TellError extends Error {
   }
 }
 
-const COMMANDS = ["help", "new", "claude", "codex", "cd", "status", "stop", "verbose", "yes", "no", "auto", "ask"];
+const COMMANDS = ["help", "new", "go", "claude", "codex", "cd", "status", "stop", "verbose", "yes", "no", "auto", "ask"];
 const STRANGER_COOLDOWN_MS = 60 * 60 * 1000;
 const SLOW_NOTICE_MS = 45_000;
+/** How much earlier conversation a session that starts fresh is caught up on. */
+const CATCH_UP_MESSAGES = 30;
+const CATCH_UP_CHARS = 600;
 
 export class Router {
   private jobs = new Map<string, Job>();
-  private queued = new Map<string, InboundMessage[]>();
+  /** Debounce timers per operator; the texts themselves wait in history.db (pending). */
+  private debounce = new Map<string, { timer: NodeJS.Timeout; due: number }>();
   private approvals = new Map<string, PendingApproval>();
   private strangerRepliedAt = new Map<string, number>();
   private permissionOverride = new Map<string, PermissionPolicy>();
@@ -145,7 +150,11 @@ export class Router {
         worker: j.worker,
         elapsedSec: Math.round((this.now() - j.startedAt) / 1000),
       })),
-      queued: [...this.queued.entries()].map(([op, q]) => ({ operator: op, count: q.length })),
+      queued: this.deps.state.history.pendingOperators().map((op) => ({
+        operator: op,
+        count: this.deps.state.history.pending(op).length,
+        startsInSec: this.debounce.has(op) ? Math.max(0, Math.round((this.debounce.get(op)!.due - this.now()) / 1000)) : null,
+      })),
       tells: [...this.tells.values()].map((t) => ({
         id: t.id,
         session: t.target.id,
@@ -177,7 +186,7 @@ export class Router {
     }
     if (!this.deps.config.operators.includes(msg.from)) return this.stranger(params, msg);
 
-    this.deps.state.transcript(msg.from, { dir: "in", text: msg.body, media: msg.media.map((m) => m.contentType) });
+    const historyId = this.deps.state.transcript(msg.from, { dir: "in", text: msg.body, media: msg.media.map((m) => m.contentType) });
     const op = this.operator(msg.from);
     this.deps.state.update(msg.from, { lastInboundAt: new Date(this.now()).toISOString() });
 
@@ -192,14 +201,58 @@ export class Router {
 
     if (!text && !msg.media.length) return;
 
-    if (this.jobs.has(msg.from)) {
-      const q = this.queued.get(msg.from) ?? [];
-      q.push(msg);
-      this.queued.set(msg.from, q);
-      if (q.length === 1) await this.say(msg.from, "got it, queued behind the current task. /stop to cancel that one.");
-      return;
+    const history = this.deps.state.history;
+    const first = !history.pending(msg.from).length;
+    history.addPending(msg.from, { msg, at: this.now(), historyId });
+    if (this.jobs.has(msg.from) && first) await this.say(msg.from, "got it, queued behind the current task. /stop to cancel that one.");
+    this.arm(msg.from);
+  }
+
+  // ---- debounce -------------------------------------------------------------
+
+  /**
+   * (Re)start the operator's quiet period. Texts wait in history.db until no new
+   * one has arrived for config.debounceMs, then run as one batch, so a thought
+   * sent as four texts is one task. With no debounce they run at once.
+   */
+  private arm(from: string, ms = this.deps.config.debounceMs): void {
+    this.disarm(from);
+    if (!(ms > 0)) return this.flush(from);
+    const timer = setTimeout(() => {
+      this.debounce.delete(from);
+      this.flush(from);
+    }, ms);
+    timer.unref?.();
+    this.debounce.set(from, { timer, due: this.now() + ms });
+  }
+
+  private disarm(from: string): void {
+    const d = this.debounce.get(from);
+    if (d) clearTimeout(d.timer);
+    this.debounce.delete(from);
+  }
+
+  /** Run everything waiting, unless a job is running: its end flushes again. */
+  private flush(from: string): void {
+    if (this.jobs.has(from)) return;
+    const history = this.deps.state.history;
+    const batch = history.pending(from);
+    history.clearPending(from);
+    if (batch.length) void this.run(from, batch);
+  }
+
+  /** After a restart: texts that were waiting out the window get the rest of it. */
+  resumePending(): void {
+    const history = this.deps.state.history;
+    for (const from of history.pendingOperators()) {
+      if (!this.deps.config.operators.includes(from)) {
+        history.clearPending(from);
+        continue;
+      }
+      const last = Math.max(...history.pending(from).map((p) => p.at));
+      this.arm(from, Math.max(0, last + this.deps.config.debounceMs - this.now()));
+      log.info("resumed waiting texts", { operator: from });
     }
-    void this.run(msg.from, [msg]);
   }
 
   private operator(address: string): OperatorState {
@@ -240,6 +293,7 @@ export class Router {
         return this.say(from, this.helpText());
       case "new": {
         state.setSession(from, op.worker, undefined);
+        state.history.record(from, { dir: RESET }); // a fresh session is not caught up past this
         return this.say(from, `fresh ${op.worker} session. same folder: ${short(op.cwd)}`);
       }
       case "claude":
@@ -259,10 +313,18 @@ export class Router {
       }
       case "status":
         return this.say(from, this.statusText(from, op));
+      case "go": {
+        const waiting = state.history.pending(from).length;
+        if (!waiting) return this.say(from, "nothing waiting.");
+        this.disarm(from);
+        if (this.jobs.has(from)) return this.say(from, "the waiting texts run as soon as the current task is done.");
+        return this.flush(from);
+      }
       case "stop": {
         const job = this.jobs.get(from);
-        const dropped = this.queued.get(from)?.length ?? 0;
-        this.queued.delete(from);
+        const dropped = state.history.pending(from).length;
+        state.history.clearPending(from);
+        this.disarm(from);
         if (!job) return this.say(from, dropped ? `cleared ${dropped} queued.` : "nothing running.");
         job.ac.abort();
         return this.say(from, `stopping ${job.worker}${dropped ? `, cleared ${dropped} queued` : ""}.`);
@@ -294,9 +356,12 @@ export class Router {
     const cmd = this.deps.config.fallthrough?.command;
     const fwd = cmd ? `\n/${cmd} <msg>: send to the old bot on this number` : "";
     return [
-      "just text me what you want done. one task at a time; more texts queue up.",
+      this.deps.config.debounceMs > 0
+        ? `just text me what you want done. I start ${fmtDuration(this.deps.config.debounceMs)} after your last text, so several texts become one task.`
+        : "just text me what you want done. one task at a time; more texts queue up.",
       "",
       "/new: fresh session",
+      "/go: start on what you sent now, without waiting",
       "/claude or /codex: switch agent (each keeps its own session)",
       "/cd <folder>: set the working folder",
       "/status: what is running, where, on what",
@@ -309,7 +374,8 @@ export class Router {
 
   private statusText(from: string, op: OperatorState): string {
     const job = this.jobs.get(from);
-    const q = this.queued.get(from)?.length ?? 0;
+    const q = this.deps.state.history.pending(from).length;
+    const due = this.debounce.get(from)?.due;
     const load = loadavg()[0]!.toFixed(2);
     const freeGb = (freemem() / 1e9).toFixed(1);
     const totalGb = (totalmem() / 1e9).toFixed(1);
@@ -318,7 +384,11 @@ export class Router {
       `agent: ${op.worker} (${this.permissions(from)}${op.verbose ? ", verbose" : ""})`,
       `folder: ${short(op.cwd)}`,
       `sessions: claude ${sess("claude")}, codex ${sess("codex")}`,
-      job ? `running: ${job.worker}, ${fmtDuration(this.now() - job.startedAt)} in${q ? `, ${q} queued` : ""}` : "idle",
+      job
+        ? `running: ${job.worker}, ${fmtDuration(this.now() - job.startedAt)} in${q ? `, ${q} queued` : ""}`
+        : q && due
+          ? `waiting: ${q} text${q === 1 ? "" : "s"}, starting in ${fmtDuration(Math.max(0, due - this.now()))} (/go to start now)`
+          : "idle",
       this.sessionsLine(),
       `box: ${this.deps.config.machineName}, load ${load}, ${freeGb}/${totalGb} GB free, up ${fmtDuration(this.now() - this.startedAt)}`,
     ].join("\n");
@@ -658,7 +728,7 @@ export class Router {
 
   // ---- jobs -------------------------------------------------------------
 
-  private async run(from: string, msgs: InboundMessage[]): Promise<void> {
+  private async run(from: string, batch: PendingMessage[]): Promise<void> {
     const { config, state, workers } = this.deps;
     const op = this.operator(from);
     const worker = workers[op.worker];
@@ -672,7 +742,7 @@ export class Router {
     }, SLOW_NOTICE_MS);
 
     try {
-      const { prompt, images } = await this.buildPrompt(from, msgs);
+      const { prompt, images } = await this.buildPrompt(from, batch, !op.sessions[op.worker]);
       job.prompt = prompt;
       const result = await worker.run({
         prompt,
@@ -710,13 +780,13 @@ export class Router {
       clearTimeout(slowNotice);
       this.jobs.delete(from);
       this.approvals.delete(from);
-      const next = this.queued.get(from);
-      this.queued.delete(from);
-      if (next?.length) void this.run(from, next);
+      // Texts that came in during the job: run them now if their quiet period is over.
+      if (!this.debounce.has(from)) this.flush(from);
     }
   }
 
-  private async buildPrompt(from: string, msgs: InboundMessage[]): Promise<{ prompt: string; images: string[] }> {
+  private async buildPrompt(from: string, batch: PendingMessage[], fresh: boolean): Promise<{ prompt: string; images: string[] }> {
+    const msgs = batch.map((p) => p.msg);
     const images: string[] = [];
     const notes: string[] = [];
     for (const m of msgs) {
@@ -744,7 +814,26 @@ export class Router {
         "\n\n" +
         prompt;
     }
+    if (fresh) prompt = this.catchUp(from, batch) + prompt;
     return { prompt, images };
+  }
+
+  /**
+   * A session that starts without one (first text, a lost session, a switch to
+   * the other worker) does not know the conversation so far. Hand it the recent
+   * part from history.db, back to the last /new.
+   */
+  private catchUp(from: string, batch: PendingMessage[]): string {
+    const ids = batch.map((p) => p.historyId).filter((id): id is number => id !== undefined);
+    const earlier = this.deps.state.history.sinceReset(from, CATCH_UP_MESSAGES, ids);
+    if (!earlier.length) return "";
+    const clip = (t: string) => (t.length > CATCH_UP_CHARS ? t.slice(0, CATCH_UP_CHARS) + " [...]" : t);
+    const lines = earlier.map((e) => `${e.dir === "in" ? "operator" : "you"} (${e.at.slice(0, 16).replace("T", " ")} UTC): ${clip(e.text.trim())}`);
+    return (
+      "[This is a new session. The conversation with the operator so far, from dispatch's history (`dispatch history` has all of it). Context only:]\n" +
+      lines.join("\n") +
+      "\n\n[The operator's new message:]\n"
+    );
   }
 
   private onEvent(from: string, job: Job, e: WorkerEvent): void {

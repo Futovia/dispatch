@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Futovia/dispatch/main/install.sh | bash
 #
-# Installs Node 22 if needed (into your home, no sudo), installs
+# Installs Node 22 (22.13+) if needed (into your home, no sudo), installs
 # @futovia/dispatch from npm, then runs `dispatch init`, which asks for your
 # Twilio details. Any arguments are passed to `dispatch init`, e.g.
 #   curl -fsSL .../install.sh | bash -s -- --sid AC... --token ... --from +1... --operator +44...
@@ -72,7 +72,11 @@ mkdir -p "$HOME/.local/bin"
 export PATH="$HOME/.local/bin:$PATH"
 
 # ---- node ---------------------------------------------------------------------
-node_ok() { have node && [ "$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" -ge "$NODE_MAJOR" ]; }
+# Node 22.13+ (or any newer major): dispatch keeps its history in the built-in node:sqlite.
+node_ok() {
+  have node && [ "$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" -ge "$NODE_MAJOR" ] &&
+    node -e 'require("node:sqlite")' >/dev/null 2>&1
+}
 if ! node_ok; then
   say "installing Node $NODE_MAJOR into ~/.local (no sudo)..."
   case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) die "unsupported OS $(uname -s)" ;; esac

@@ -2,11 +2,14 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, appendF
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import type { WorkerName } from "./config.js";
+import { History } from "./history.js";
 
 /**
- * All durable state is one JSON file plus grep-able JSONL transcripts in the
- * state dir. No database. The interesting memory lives in the agents' own
- * session stores (~/.claude, ~/.codex); we only keep the ids to resume them.
+ * Durable state is one JSON file (settings, session ids), grep-able JSONL
+ * transcripts, and history.db: the whole conversation per operator across
+ * sessions, plus texts waiting out the debounce (see history.ts). The working
+ * memory of a session still lives in the agents' own stores (~/.claude,
+ * ~/.codex); we keep the ids to resume them.
  */
 export interface OperatorState {
   worker: WorkerName;
@@ -46,6 +49,7 @@ export class State {
   readonly file: string;
   readonly mediaDir: string;
   readonly transcriptsDir: string;
+  private db?: History;
 
   constructor(readonly dir: string) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -75,6 +79,12 @@ export class State {
     const tmp = this.file + ".tmp";
     writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
     renameSync(tmp, this.file);
+  }
+
+  /** Opened on first use, so `dispatch hook` and `dispatch send` never touch it. */
+  get history(): History {
+    this.db ??= new History(join(this.dir, "history.db"), { importDir: this.transcriptsDir });
+    return this.db;
   }
 
   get localToken(): string {
@@ -150,9 +160,13 @@ export class State {
     return ids;
   }
 
-  /** One JSONL line per inbound/outbound message, per operator. `grep` is the UI. */
-  transcript(address: string, entry: Record<string, unknown>): void {
+  /** One line per inbound/outbound message, per operator: a JSONL file for `grep`, a row for history.db. */
+  transcript(address: string, entry: Record<string, unknown>): number {
+    const t = new Date().toISOString();
     const file = join(this.transcriptsDir, address.replace(/[^0-9]/g, "") + ".jsonl");
-    appendFileSync(file, JSON.stringify({ t: new Date().toISOString(), ...entry }) + "\n");
+    // History first: on a first open it imports the JSONL, which must not already hold this line.
+    const id = this.history.record(address, entry, t);
+    appendFileSync(file, JSON.stringify({ t, ...entry }) + "\n");
+    return id;
   }
 }
