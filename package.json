@@ -1,6 +1,6 @@
 {
   "name": "@futovia/dispatch",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Text your server. A one-command WhatsApp (Twilio) front door to Claude Code on your own box: it works the machine, spins up sessions for subtasks, and texts you back.",
   "keywords": [
     "claude",
@@ -34,7 +34,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   },
   "publishConfig": {
     "access": "public"

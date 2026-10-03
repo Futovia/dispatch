@@ -21,7 +21,7 @@ On the box (a VPS, a home server, a Mac mini under the desk):
 curl -fsSL https://raw.githubusercontent.com/Futovia/dispatch/main/install.sh | bash
 ```
 
-That installs Node 22 if needed, installs `@futovia/dispatch`, and runs `dispatch init`, which walks you through six steps:
+That installs Node 22 (22.13 or newer) if needed, installs `@futovia/dispatch`, and runs `dispatch init`, which walks you through six steps:
 
 1. **Claude login**: uses your Claude subscription (or `ANTHROPIC_API_KEY`). Claude Code does not even need to be installed first; dispatch ships with it.
 2. **Twilio account**: paste your Account SID and Auth Token (console.twilio.com, dashboard). Checked on the spot.
@@ -32,7 +32,7 @@ That installs Node 22 if needed, installs `@futovia/dispatch`, and runs `dispatc
 
 Then text the number.
 
-Already have Node 22+? `npm install -g @futovia/dispatch && dispatch init` does the same.
+Already have Node 22.13+? `npm install -g @futovia/dispatch && dispatch init` does the same.
 
 Running as root on a fresh VPS? The installer creates a normal user called `dispatch` (Claude Code will not run with full permissions as root), offers it passwordless sudo so the agent can install packages and fix system problems, and installs there.
 
@@ -60,15 +60,18 @@ Text what you want done. Anything that is not a command goes to Claude, with you
 | command | what it does |
 |---|---|
 | `/new` | fresh session |
+| `/go` | start on what you sent now, without waiting out the debounce |
 | `/cd <folder>` | set the working folder (`/cd` shows it) |
 | `/status` | what is running, load, memory, uptime |
-| `/stop` | cancel the running job and clear the queue |
+| `/stop` | cancel the running job and drop texts still waiting |
 | `/verbose` | narrate tool calls as they happen |
 | `/auto`, `/ask` | act freely, or ask you before every command and edit |
 | `/yes`, `/no` | answer an approval (plain "yes" / "no" works too) |
 | `/claude`, `/codex` | switch agent (Codex is optional: `dispatch enable-codex`) |
 
-One conversation, one job at a time: more texts queue behind it. The session is kept until you say `/new`, and it auto-compacts, so "what was that error yesterday" works.
+One conversation, one job at a time. Dispatch starts a minute after your last text (`DISPATCH_DEBOUNCE_SEC`, default 60), and every new text restarts that minute, so a thought sent as four texts at 1:43, 1:44, 1:45 and 1:46 runs as one task at 1:47. Texts sent while a job runs wait for it, then for their own quiet minute. `/go` skips the wait; `DISPATCH_DEBOUNCE_SEC=0` turns it off. Waiting texts are kept on disk, so a restart does not lose them.
+
+The session is kept until you say `/new`, and it auto-compacts, so "what was that error yesterday" works. Beyond that, every message in and out is kept in `~/.dispatch/history.db` (SQLite) across sessions: when a session starts without one (the first text after a lost session, or switching between `/claude` and `/codex`), it is caught up on the conversation since your last `/new`, and the agent can look further back with `dispatch history`.
 
 ## Subtasks: spawning sessions
 
@@ -103,6 +106,7 @@ Up to `DISPATCH_MAX_SPAWNS` (default 4) run at once. Each is a normal Claude Cod
 | `dispatch service install` | run as a service (systemd user unit / launchd); also `uninstall`, `status`, `logs` |
 | `dispatch send "text"` | text yourself from any script: `make test 2>&1 \| tail -5 \| dispatch send` |
 | `dispatch status` | what the daemon is doing right now |
+| `dispatch history` | the conversation so far, across sessions: `-n 100`, `--search <text>`, `--json` |
 | `dispatch enable-codex` | add the optional Codex worker (`/codex`) |
 
 ## Security, plainly
@@ -178,7 +182,8 @@ Already have a bot on that WhatsApp number? Set `DISPATCH_FALLTHROUGH_URL` to it
 ~/.dispatch/DISPATCH.md     your instructions to the agent, appended to its system prompt
 ~/.dispatch/state.json      operator settings, session ids, the local token
 ~/.dispatch/sessions/       one JSON per Claude Code session on the box, written by the hooks
-~/.dispatch/transcripts/    one JSONL per operator; grep is the UI
+~/.dispatch/history.db      every message in and out, across sessions, and texts waiting out the debounce (SQLite)
+~/.dispatch/transcripts/    the same messages as one JSONL per operator; grep is the UI
 ~/.dispatch/media/          photos you sent
 ~/.dispatch/public-url      the current tunnel URL
 ```
@@ -192,9 +197,11 @@ WhatsApp -> Twilio -> https://<tunnel or host>/twilio/whatsapp -> dispatch (127.
                                                    |
                                                   yes
                                                    |
-                                           command? --yes--> /new /cd /status ...
+                                           command? --yes--> /new /go /cd /status ...
                                                    |
                                                   no
+                                                   |
+                                    history.db, wait until 60s with no new text
                                                    |
                                     Claude Agent SDK (resumed session)  --dispatch spawn-->  more sessions
                                                    |

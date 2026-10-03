@@ -40,6 +40,8 @@ export interface Config {
   maxTurns: number;
   jobTimeoutMs: number;
   approvalTimeoutMs: number;
+  /** Quiet period after an operator's last text before the batch runs; each new text restarts it. 0 = run at once. */
+  debounceMs: number;
   /** Where non-operator webhooks go (re-signed), if anywhere. */
   fallthrough?: { url: string; signedUrl: string; command?: string };
   /** Twilio Content template used for alerts outside the 24h window ({{1}} machine, {{2}} text). */
@@ -161,6 +163,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     maxTurns: num(merged.DISPATCH_MAX_TURNS, 200),
     jobTimeoutMs: num(merged.DISPATCH_JOB_TIMEOUT_MIN, 60) * 60_000,
     approvalTimeoutMs: num(merged.DISPATCH_APPROVAL_TIMEOUT_MIN, 15) * 60_000,
+    debounceMs: Math.max(0, num(merged.DISPATCH_DEBOUNCE_SEC, 60)) * 1000,
     fallthrough,
     fallthroughReply: merged.DISPATCH_FALLTHROUGH_REPLY || undefined,
     alertTemplateSid: merged.DISPATCH_ALERT_TEMPLATE_SID || undefined,
@@ -231,6 +234,10 @@ DISPATCH_MAX_SPAWNS=4
 # its turn before forking it instead of stopping it; and caps the headless run.
 DISPATCH_TELL_IDLE_WAIT_SEC=90
 DISPATCH_TELL_TIMEOUT_MIN=30
+
+# Wait this many seconds after your last text before starting, so a burst of texts
+# runs as one task. Every new text restarts the wait. Send /go to skip it, 0 = off.
+DISPATCH_DEBOUNCE_SEC=60
 
 # Optional limits.
 DISPATCH_MAX_TURNS=200

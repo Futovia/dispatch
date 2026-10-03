@@ -22,6 +22,8 @@ const USAGE = `dispatch - text your server.
                                    --bg (return at once, result is texted) --timeout <min> --model <name>
                                    the session stays registered: dispatch tell <folder> continues it
   dispatch hook                    Claude Code hook entry point (reads the hook JSON on stdin)
+  dispatch history                 the WhatsApp conversation so far, across sessions (history.db)
+                                   -n <count> (default 30) --search <text> --operator <number> --json
   dispatch status                  what the running daemon is doing
   dispatch doctor                  check logins, config, Twilio, webhook, public URL
   dispatch enable-codex            install the optional Codex worker (/codex)
@@ -49,6 +51,8 @@ async function main(argv: string[]): Promise<void> {
       return spawn(rest);
     case "hook":
       return hook();
+    case "history":
+      return history(rest);
     case "status":
       return status();
     case "doctor":
@@ -216,6 +220,7 @@ async function start(): Promise<void> {
   };
 
   server.listen(config.port, config.host, () => {
+    router.resumePending();
     if (config.tunnel) void runTunnel();
     else void wire();
     log.info("dispatch up", {
@@ -341,6 +346,43 @@ async function alert(args: string[]): Promise<void> {
   }
   const sid = typeof json.sessionId === "string" ? json.sessionId.slice(0, 8) : "no session";
   process.stdout.write(`sent (${sid}, ${typeof json.cwd === "string" ? basename(json.cwd) : "no folder"})\n`);
+}
+
+/** Reads history.db directly, so it works with the daemon down too. */
+async function history(args: string[]): Promise<void> {
+  const { State } = await import("./state.js");
+  const { normalizeAddress } = await import("./config.js");
+  let limit = 30;
+  let search: string | undefined;
+  let operator: string | undefined;
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "-n" || a === "--limit") limit = Number(args[++i]);
+    else if (a === "--search" || a === "-s") search = args[++i];
+    else if (a === "--operator") operator = normalizeAddress(args[++i] ?? "");
+    else if (a === "--json") json = true;
+    else if (!search) search = a;
+  }
+  if (!Number.isFinite(limit) || limit <= 0) {
+    process.stderr.write('usage: dispatch history [-n <count>] [--search <text>] [--operator <number>] [--json]\n');
+    process.exit(2);
+  }
+  const entries = new State(defaultStateDir()).history.recent({ operator, limit, search });
+  if (json) {
+    process.stdout.write(JSON.stringify(entries, null, 2) + "\n");
+    return;
+  }
+  if (!entries.length) {
+    process.stdout.write(search ? `nothing matching "${search}".\n` : "no history yet.\n");
+    return;
+  }
+  const many = new Set(entries.map((e) => e.operator)).size > 1;
+  for (const e of entries) {
+    const who = e.dir === "in" ? "operator" : e.dir === "out" ? "dispatch" : e.dir;
+    const head = [e.at.slice(0, 16).replace("T", " "), many ? e.operator.replace("whatsapp:", "") : "", who].filter(Boolean).join("  ");
+    process.stdout.write(`${head}\n${e.text.trim() ? e.text.trim().replace(/^/gm, "  ") : "  -"}\n\n`);
+  }
 }
 
 async function sessions(): Promise<void> {
@@ -506,6 +548,14 @@ async function doctor(): Promise<void> {
   if (process.getuid?.() === 0) {
     if (config.allowRoot) warn("running as root", "DISPATCH_ALLOW_ROOT is set; the agent has root");
     else bad("running as root", "Claude Code will not take full permissions as root. use a normal user (the installer creates one), or set DISPATCH_ALLOW_ROOT=1");
+  }
+
+  try {
+    const { State } = await import("./state.js");
+    const h = new State(config.stateDir).history;
+    ok("history", `${h.file} (debounce ${config.debounceMs / 1000}s)`);
+  } catch (e) {
+    bad("history", `${e instanceof Error ? e.message : String(e)} (needs Node 22.13+ for node:sqlite; you have ${process.version})`);
   }
 
   const { claudeBin, claudeLoggedIn } = await import("./init.js");

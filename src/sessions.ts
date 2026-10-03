@@ -354,6 +354,15 @@ export function ancestors(pid: number): number[] {
 }
 
 function parentPid(pid: number): number | undefined {
+  if (process.platform !== "linux") {
+    // No /proc on macOS: ask ps.
+    try {
+      const ppid = Number(execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 }).trim());
+      return Number.isInteger(ppid) && ppid > 0 ? ppid : undefined;
+    } catch {
+      return undefined;
+    }
+  }
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     // "pid (comm) state ppid ..." and comm may contain spaces or parens.
