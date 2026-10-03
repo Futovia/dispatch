@@ -36,13 +36,17 @@ export function parseForm(body: string): Record<string, string> {
   return out;
 }
 
+/** An attachment: a URL to fetch (Twilio) or a file already on disk (iMessage). */
 export interface InboundMedia {
-  url: string;
+  url?: string;
+  path?: string;
   contentType: string;
 }
 
+/** One text from any channel. `from` is the sender's address: "whatsapp:+1555...", "imessage:me@x.com". */
 export interface InboundMessage {
   sid: string;
+  channel?: "whatsapp" | "imessage";
   from: string;
   to: string;
   body: string;
@@ -62,7 +66,7 @@ export function parseInbound(params: Record<string, string>): InboundMessage | n
     const url = params[`MediaUrl${i}`];
     if (url) media.push({ url, contentType: params[`MediaContentType${i}`] ?? "application/octet-stream" });
   }
-  return { sid, from, to, body: params.Body ?? "", media, profileName: params.ProfileName };
+  return { sid, channel: "whatsapp", from, to, body: params.Body ?? "", media, profileName: params.ProfileName };
 }
 
 export class TwilioSendError extends Error {

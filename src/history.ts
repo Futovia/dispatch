@@ -170,7 +170,8 @@ export class History {
     this.db.exec("BEGIN");
     try {
       for (const name of readdirSync(dir).filter((n) => n.endsWith(".jsonl"))) {
-        const operator = `whatsapp:+${name.replace(/\.jsonl$/, "")}`;
+        const base = name.replace(/\.jsonl$/, "");
+        const operator = /^\d+$/.test(base) ? `whatsapp:+${base}` : base.replace(/^imessage-/, "imessage:");
         for (const line of readFileSync(join(dir, name), "utf8").split("\n")) {
           if (!line.trim()) continue;
           try {
@@ -203,7 +204,7 @@ function toEntry(r: Record<string, unknown>): HistoryEntry {
 }
 
 /** node:sqlite prints an ExperimentalWarning on load on Node 22; it is stable enough for this and the noise lands in the log. */
-function loadSqlite(): typeof import("node:sqlite") {
+export function loadSqlite(): typeof import("node:sqlite") {
   const emit = process.emitWarning;
   process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
     const text = typeof warning === "string" ? warning : warning.message;

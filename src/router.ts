@@ -7,6 +7,7 @@ import { Sessions, stopProcess, sleep, sameModel, transcriptModel, type SessionR
 import type { Worker, ApprovalRequest, WorkerEvent } from "./workers/types.js";
 import { parseInbound, type InboundMessage } from "./twilio.js";
 import { buildSystemPrompt } from "./prompt.js";
+import { channelOf } from "./channels/types.js";
 import { RESET, type PendingMessage } from "./history.js";
 import { log } from "./log.js";
 
@@ -20,8 +21,10 @@ export interface RouterDeps {
   state: State;
   sessions: Sessions;
   workers: Record<WorkerName, Worker>;
-  /** Deliver text to a WhatsApp address (already formatted + chunked by the caller). */
+  /** Deliver markdown to an operator (by id; the caller picks the channel) or to a raw address. */
   send: (to: string, text: string) => Promise<void>;
+  /** Each channel's health, for /status and `dispatch doctor`. */
+  channelStatus?: () => Record<string, { ok: boolean; detail?: string }>;
   /** Forward a raw webhook to the fallthrough service. */
   forward: (params: Record<string, string>) => Promise<void>;
   /** Download inbound media; returns the bytes. */
@@ -145,6 +148,7 @@ export class Router {
   snapshot() {
     return {
       uptimeSec: Math.round((this.now() - this.startedAt) / 1000),
+      channels: this.deps.channelStatus?.() ?? {},
       jobs: [...this.jobs.entries()].map(([op, j]) => ({
         operator: op,
         worker: j.worker,
@@ -180,32 +184,44 @@ export class Router {
   async handleWebhook(params: Record<string, string>): Promise<void> {
     const msg = parseInbound(params);
     if (!msg) return; // a status callback or something else we do not care about
+    return this.handleInbound(msg, params);
+  }
+
+  /**
+   * A text from any channel. The sender's address is mapped to its operator, so
+   * a WhatsApp number and an Apple ID email of the same person share one
+   * conversation; the reply goes back to whichever they used last.
+   */
+  async handleInbound(msg: InboundMessage, raw?: Record<string, string>): Promise<void> {
     if (!this.deps.state.markSeen(msg.sid)) {
-      log.debug("duplicate webhook ignored", { sid: msg.sid });
+      log.debug("duplicate message ignored", { sid: msg.sid });
       return;
     }
-    if (!this.deps.config.operators.includes(msg.from)) return this.stranger(params, msg);
+    const from = this.deps.config.aliases[msg.from];
+    if (!from) return this.stranger(msg, raw);
 
-    const historyId = this.deps.state.transcript(msg.from, { dir: "in", text: msg.body, media: msg.media.map((m) => m.contentType) });
-    const op = this.operator(msg.from);
-    this.deps.state.update(msg.from, { lastInboundAt: new Date(this.now()).toISOString() });
+    const via = from === msg.from ? {} : { via: msg.from };
+    const historyId = this.deps.state.transcript(from, { dir: "in", text: msg.body, media: msg.media.map((m) => m.contentType), ...via });
+    const op = this.operator(from);
+    const at = new Date(this.now()).toISOString();
+    this.deps.state.update(from, { lastInboundAt: at, replyTo: msg.from, lastInboundVia: { ...(op.lastInboundVia ?? {}), [msg.from]: at } });
 
     const text = msg.body.trim();
     const cmd = this.parseCommand(text);
-    if (cmd) return this.command(msg.from, op, cmd.name, cmd.rest, params);
+    if (cmd) return this.command(from, op, cmd.name, cmd.rest, raw);
 
-    const pending = this.approvals.get(msg.from);
+    const pending = this.approvals.get(from);
     if (pending && /^(y|yes|yep|ok|go|sure|n|no|nope|deny)\.?$/i.test(text)) {
-      return this.answerApproval(msg.from, /^(y|yes|yep|ok|go|sure)/i.test(text));
+      return this.answerApproval(from, /^(y|yes|yep|ok|go|sure)/i.test(text));
     }
 
     if (!text && !msg.media.length) return;
 
     const history = this.deps.state.history;
-    const first = !history.pending(msg.from).length;
-    history.addPending(msg.from, { msg, at: this.now(), historyId });
-    if (this.jobs.has(msg.from) && first) await this.say(msg.from, "got it, queued behind the current task. /stop to cancel that one.");
-    this.arm(msg.from);
+    const first = !history.pending(from).length;
+    history.addPending(from, { msg, at: this.now(), historyId });
+    if (this.jobs.has(from) && first) await this.say(from, "got it, queued behind the current task. /stop to cancel that one.");
+    this.arm(from);
   }
 
   // ---- debounce -------------------------------------------------------------
@@ -255,6 +271,14 @@ export class Router {
     }
   }
 
+  /** The channel an operator is talking on now: where they last texted from. */
+  private channelFor(operator: string): "whatsapp" | "imessage" {
+    const op = this.deps.state.operator(operator, { worker: this.deps.config.defaultWorker, cwd: this.deps.config.workspace });
+    const on = this.deps.config.channels;
+    const guess = (op.replyTo && channelOf(op.replyTo)) || channelOf(operator);
+    return guess && on.includes(guess) ? guess : on[0]!;
+  }
+
   private operator(address: string): OperatorState {
     return this.deps.state.operator(address, {
       worker: this.deps.config.defaultWorker,
@@ -280,11 +304,13 @@ export class Router {
     op: OperatorState,
     name: string,
     rest: string,
-    params: Record<string, string>,
+    params?: Record<string, string>,
   ): Promise<void> {
     const { config, state } = this.deps;
     if (name === config.fallthrough?.command) {
       if (!rest) return this.say(from, `usage: /${name} <message>`);
+      // Only a WhatsApp webhook can be re-signed and handed to the old bot.
+      if (!params) return this.say(from, `/${name} only works from WhatsApp.`);
       await this.deps.forward({ ...params, Body: rest });
       return;
     }
@@ -549,7 +575,7 @@ export class Router {
         fork: mode === "fork",
         signal: job.ac.signal,
         permissions: "auto",
-        systemPrompt: buildSystemPrompt({ machineName: config.machineName, cwd: target.cwd, stateDir: config.stateDir }),
+        systemPrompt: buildSystemPrompt({ machineName: config.machineName, cwd: target.cwd, stateDir: config.stateDir, channel: this.channelFor(config.operators[0]!) }),
         model,
         maxTurns: config.maxTurns,
         onEvent: () => undefined,
@@ -665,7 +691,7 @@ export class Router {
         cwd: job.cwd,
         signal: job.ac.signal,
         permissions: "auto",
-        systemPrompt: buildSystemPrompt({ machineName: config.machineName, cwd: job.cwd, stateDir: config.stateDir }),
+        systemPrompt: buildSystemPrompt({ machineName: config.machineName, cwd: job.cwd, stateDir: config.stateDir, channel: this.channelFor(config.operators[0]!) }),
         model: job.model,
         maxTurns: config.maxTurns,
         onEvent: () => undefined,
@@ -751,7 +777,7 @@ export class Router {
         resume: op.sessions[op.worker],
         signal: ac.signal,
         permissions: this.permissions(from),
-        systemPrompt: buildSystemPrompt({ machineName: config.machineName, cwd: op.cwd, stateDir: config.stateDir }),
+        systemPrompt: buildSystemPrompt({ machineName: config.machineName, cwd: op.cwd, stateDir: config.stateDir, channel: this.channelFor(from) }),
         model: op.worker === "claude" ? config.claudeModel : config.codexModel,
         maxTurns: config.maxTurns,
         onEvent: (e) => this.onEvent(from, job, e),
@@ -792,10 +818,12 @@ export class Router {
     for (const m of msgs) {
       for (const [i, media] of m.media.entries()) {
         try {
-          const bytes = await this.deps.download(media.url);
-          const ext = extensionFor(media.contentType);
-          const file = join(this.deps.state.mediaDir, `${m.sid}-${i}${ext}`);
-          writeFileSync(file, bytes);
+          let file = media.path;
+          if (!file) {
+            const bytes = await this.deps.download(media.url ?? "");
+            file = join(this.deps.state.mediaDir, `${safeName(m.sid)}-${i}${extensionFor(media.contentType)}`);
+            writeFileSync(file, bytes);
+          }
           if (media.contentType.startsWith("image/")) images.push(file);
           else notes.push(`[Attached file: ${file} (${media.contentType})]`);
         } catch (e) {
@@ -873,8 +901,13 @@ export class Router {
 
   // ---- strangers ------------------------------------------------------------
 
-  private async stranger(params: Record<string, string>, msg: InboundMessage): Promise<void> {
+  private async stranger(msg: InboundMessage, params?: Record<string, string>): Promise<void> {
     const { config } = this.deps;
+    // iMessage strangers are ignored, never answered: the Mac's Apple ID is a personal inbox.
+    if (!params || channelOf(msg.from) !== "whatsapp") {
+      log.info("ignoring stranger", { from: msg.from });
+      return;
+    }
     if (config.fallthrough) {
       log.info("forwarding stranger", { from: msg.from });
       await this.deps.forward(params);
@@ -935,4 +968,8 @@ function extensionFor(contentType: string): string {
     "text/plain": ".txt",
   };
   return map[contentType.split(";")[0]!.trim()] ?? "";
+}
+
+function safeName(s: string): string {
+  return s.replace(/[^a-zA-Z0-9_-]/g, "_");
 }

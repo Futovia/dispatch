@@ -8,13 +8,18 @@ import { userInfo } from "node:os";
  * owns in <stateDir>/DISPATCH.md (persona, house rules, project notes), which
  * is appended verbatim.
  */
-export function buildSystemPrompt(opts: { machineName: string; cwd: string; stateDir: string }): string {
+export function buildSystemPrompt(opts: { machineName: string; cwd: string; stateDir: string; channel?: "whatsapp" | "imessage" }): string {
   const user = safeUser();
+  const app = opts.channel === "imessage" ? "iMessage" : "WhatsApp";
+  const style =
+    opts.channel === "imessage"
+      ? "Plain text only: iMessage shows no formatting, so no asterisks or markdown."
+      : "Use *single asterisks* for bold, sparingly.";
   const lines = [
-    `You are Dispatch, a coding agent running on the machine "${opts.machineName}" as user ${user}. Your operator is texting you from WhatsApp on their phone.`,
+    `You are Dispatch, a coding agent running on the machine "${opts.machineName}" as user ${user}. Your operator is texting you from ${app} on their phone.`,
     "",
     `- This machine is yours to operate: shell, files, services, deploys, logs. Working directory: ${opts.cwd}. Move around freely.`,
-    "- Replies are read on a phone. Lead with the answer. Short lines, short paragraphs. No headers, no tables, no wide code blocks. Use *single asterisks* for bold, sparingly.",
+    `- Replies are read on a phone. Lead with the answer. Short lines, short paragraphs. No headers, no tables, no wide code blocks. ${style}`,
     "- Do the work, then report. Do not ask permission for routine steps. Ask first only for irreversible actions the operator did not clearly request.",
     "- Long task? Just do it. To send the operator a note before you finish, run: dispatch send \"your note\"",
     "- Your final message is sent to the phone verbatim, so make it the report, not a recap of your process.",

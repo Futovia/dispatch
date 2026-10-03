@@ -72,7 +72,7 @@ async function main(argv: string[]): Promise<void> {
 
 async function start(): Promise<void> {
   // Heavy imports live here so `dispatch hook` (run on every prompt) stays fast.
-  const [{ State }, { Sessions }, { Router }, { createDispatchServer }, { ClaudeWorker }, codex, twilio, { renderForWhatsApp }, { log }] =
+  const [{ State }, { Sessions }, { Router }, { createDispatchServer }, { ClaudeWorker }, codex, twilio, { log }] =
     await Promise.all([
       import("./state.js"),
       import("./sessions.js"),
@@ -82,10 +82,12 @@ async function start(): Promise<void> {
       // Codex is optional (its SDK is ~300MB): `dispatch enable-codex` installs it.
       import("./workers/codex.js").catch(() => undefined),
       import("./twilio.js"),
-      import("./wa-format.js"),
       import("./log.js"),
     ]);
-  const { sendWhatsApp, sendWhatsAppTemplate, downloadMedia, forwardWebhook, TwilioSendError } = twilio;
+  const { downloadMedia, forwardWebhook } = twilio;
+  const { WhatsAppChannel } = await import("./channels/whatsapp.js");
+  const { pickAddress } = await import("./channels/route.js");
+  const { channelOf } = await import("./channels/types.js");
 
   const config = loadConfig();
   if (config.allowRoot) process.env.DISPATCH_ALLOW_ROOT = "1"; // read by the claude worker
@@ -100,67 +102,29 @@ async function start(): Promise<void> {
   const sessions = new Sessions(config.stateDir);
   const creds = config.twilio;
 
-  // WhatsApp only lets a business message someone freely for 24h after their
-  // last message. Past that only an approved template gets through, and the
-  // rejection is asynchronous (the API says 200, the status callback says
-  // 63016). So: pick the template up front when the window is clearly closed,
-  // and resend via template when a status callback reports 63016 anyway.
-  const WINDOW_MS = 23 * 60 * 60 * 1000;
-  // Read at send time: with a tunnel the public URL is only known after startup.
-  const statusCallback = () => (config.publicUrl ? config.publicUrl + config.statusPath : undefined);
-  const recentOutbound = new Map<string, { to: string; text: string; template: boolean }>();
-  const remember = (sid: string, entry: { to: string; text: string; template: boolean }) => {
-    if (!sid) return;
-    recentOutbound.set(sid, entry);
-    if (recentOutbound.size > 300) recentOutbound.delete(recentOutbound.keys().next().value!);
-  };
-  const windowOpen = (to: string): boolean => {
-    const last = state.operator(to, { worker: config.defaultWorker, cwd: config.workspace }).lastInboundAt;
-    return Boolean(last) && Date.now() - Date.parse(last!) < WINDOW_MS;
-  };
-  const viaTemplate = async (to: string, text: string): Promise<void> => {
-    if (!config.alertTemplateSid) throw new TwilioSendError("outside the 24h window and no DISPATCH_ALERT_TEMPLATE_SID", 0, 63016);
-    // Template variables cannot hold newlines; flatten. The operator texting back reopens the window.
-    const flat = text.replace(/\s*\n+\s*/g, " / ").replace(/\s{4,}/g, "   ").slice(0, 1000);
-    const { sid } = await sendWhatsAppTemplate(creds, config.twilio.from, to, config.alertTemplateSid, { "1": config.machineName, "2": flat }, { statusCallback: statusCallback() });
-    remember(sid, { to, text, template: true });
-    log.info("sent via template (outside 24h window)", { to, sid });
-  };
+  const whatsapp = config.twilio ? new WhatsAppChannel(config, state) : undefined;
+  let imessage: import("./channels/imessage.js").IMessageChannel | undefined;
+  const channels = () => ({ ...(whatsapp ? { whatsapp } : {}), ...(imessage ? { imessage } : {}) });
 
+  /** To an operator (by id, routed to where they texted from last) or to a raw address (a stranger). */
   const send = async (to: string, text: string): Promise<void> => {
-    for (const part of renderForWhatsApp(text)) {
-      if (!windowOpen(to) && config.alertTemplateSid) {
-        await viaTemplate(to, part);
-        continue;
-      }
-      try {
-        const { sid } = await sendWhatsApp(creds, config.twilio.from, to, part, { statusCallback: statusCallback() });
-        remember(sid, { to, text: part, template: false });
-      } catch (e) {
-        if (e instanceof TwilioSendError && e.outsideWindow) {
-          if (!config.alertTemplateSid) {
-            log.warn("outside WhatsApp 24h window and no DISPATCH_ALERT_TEMPLATE_SID; operator must text first", { to });
-            return;
-          }
-          await viaTemplate(to, part);
-          continue;
-        }
-        throw e;
-      }
+    let address = to;
+    if (config.operators.includes(to)) {
+      const op = state.operator(to, { worker: config.defaultWorker, cwd: config.workspace });
+      const picked = pickAddress({
+        operator: to,
+        aliases: config.aliases,
+        up: Object.keys(channels()) as Array<"whatsapp" | "imessage">,
+        replyTo: op.replyTo,
+        lastInboundVia: op.lastInboundVia,
+        whatsappWindowOpen: (a) => whatsapp?.windowOpen(a) ?? false,
+      });
+      if (!picked) throw new Error(`no channel can reach ${to}`);
+      address = picked;
     }
-  };
-
-  const onStatus = async (params: Record<string, string>): Promise<void> => {
-    const sid = params.MessageSid ?? params.SmsSid ?? "";
-    const st = params.MessageStatus ?? "";
-    if (st !== "failed" && st !== "undelivered") return;
-    const code = Number(params.ErrorCode ?? "0");
-    const known = recentOutbound.get(sid);
-    log.warn("outbound message not delivered", { sid, status: st, code, to: params.To, template: known?.template ?? null });
-    if (code === 63016 && known && !known.template && config.alertTemplateSid) {
-      recentOutbound.delete(sid);
-      await viaTemplate(known.to, known.text);
-    }
+    const channel = channels()[channelOf(address) ?? "whatsapp"];
+    if (!channel) throw new Error(`no channel for ${address}`);
+    await channel.send(address, text);
   };
 
   const router = new Router({
@@ -170,12 +134,29 @@ async function start(): Promise<void> {
     workers: { claude: new ClaudeWorker(), codex: codex ? new codex.CodexWorker() : missingCodex() },
     send,
     forward: async (params) => {
-      if (!config.fallthrough) return;
+      if (!config.fallthrough || !creds) return;
       const { status } = await forwardWebhook(creds.authToken, config.fallthrough, params);
       if (status >= 300) log.warn("fallthrough rejected the webhook", { status });
     },
-    download: (url) => downloadMedia(creds, url),
+    download: (url) => {
+      if (!creds) throw new Error("no Twilio credentials to fetch media with");
+      return downloadMedia(creds, url);
+    },
+    channelStatus: () => Object.fromEntries(Object.entries(channels()).map(([name, ch]) => [name, ch.status()])),
   });
+
+  if (config.imessage) {
+    const { IMessageChannel } = await import("./channels/imessage.js");
+    imessage = new IMessageChannel(
+      { dbPath: config.imessage.dbPath, pollMs: config.imessage.pollMs, mediaDir: state.mediaDir },
+      {
+        accept: (address) => address in config.aliases,
+        onMessage: (msg) => router.handleInbound(msg),
+        cursor: () => state.cursor("imessage"),
+        setCursor: (n) => state.setCursor("imessage", n),
+      },
+    );
+  }
 
   const server = createDispatchServer({
     config,
@@ -184,17 +165,17 @@ async function start(): Promise<void> {
     sendToOperators: async (text, to) => {
       for (const op of to ? [to] : config.operators) await send(op, text);
     },
-    onStatus,
+    onStatus: async (params) => whatsapp?.onStatus(params),
   });
 
   // Twilio must know where to post. With a tunnel the URL is new on every
   // start (and every tunnel restart), so it is re-pointed each time.
   const { pointWebhook } = await import("./twilio-admin.js");
   const wire = async (): Promise<void> => {
-    if (!config.autoWebhook || !config.publicUrl) return;
+    if (!config.autoWebhook || !config.publicUrl || !creds) return;
     const url = config.publicUrl + config.webhookPath;
     try {
-      const r = await pointWebhook(creds, config.twilio.from, url, { statusUrl: config.publicUrl + config.statusPath, allowShared: config.sharedService });
+      const r = await pointWebhook(creds, creds.from, url, { statusUrl: config.publicUrl + config.statusPath, allowShared: config.sharedService });
       log.info(r.changed ? "twilio webhook pointed here" : "twilio webhook already points here", { via: r.what, url, previous: r.previous || null });
     } catch (e) {
       log.error("could not point the twilio webhook; set it by hand", { url, err: e instanceof Error ? e.message : String(e) });
@@ -228,11 +209,15 @@ async function start(): Promise<void> {
 
   server.listen(config.port, config.host, () => {
     router.resumePending();
-    if (config.tunnel) void runTunnel();
-    else void wire();
+    if (whatsapp) {
+      if (config.tunnel) void runTunnel();
+      else void wire();
+    }
+    imessage?.start();
     log.info("dispatch up", {
       bind: `${config.host}:${config.port}`,
-      webhook: config.tunnel ? "(tunnel, URL follows)" : config.publicUrl + config.webhookPath,
+      channels: config.channels.join(","),
+      webhook: !whatsapp ? null : config.tunnel ? "(tunnel, URL follows)" : config.publicUrl + config.webhookPath,
       operators: config.operators.length,
       worker: config.defaultWorker,
       permissions: config.permissions,
@@ -243,6 +228,7 @@ async function start(): Promise<void> {
 
   const shutdown = () => {
     stopping = true;
+    imessage?.stop();
     tunnelChild?.kill();
     log.info("dispatch shutting down");
     server.close(() => process.exit(0));
@@ -577,56 +563,79 @@ async function doctor(): Promise<void> {
     ok("codex", "not installed (optional: dispatch enable-codex)");
   }
 
-  const admin = await import("./twilio-admin.js");
-  let credsOk = false;
-  try {
-    const acct = await admin.checkCredentials(config.twilio);
-    ok("twilio credentials", `account "${acct.name}"`);
-    credsOk = true;
-  } catch (e) {
-    bad("twilio credentials", e instanceof Error ? e.message : String(e));
-  }
-
-  // With a tunnel, the URL is whatever the running daemon last got.
-  let publicUrl = config.publicUrl;
-  if (config.tunnel) {
-    const f = join(config.stateDir, "public-url");
-    publicUrl = existsSync(f) ? readFileSync(f, "utf8").trim() : "";
-    if (!publicUrl) warn("tunnel", "no tunnel URL yet: is the daemon running? (dispatch start)");
-  }
-
-  if (publicUrl) {
+  if (config.twilio) {
+    const tw = config.twilio;
+    const admin = await import("./twilio-admin.js");
+    let credsOk = false;
     try {
-      const res = await fetch(`${publicUrl}/health`, { signal: AbortSignal.timeout(8000) });
-      if (res.ok) ok("public url", `${publicUrl}/health`);
-      else bad("public url", `${publicUrl}/health -> HTTP ${res.status} (is the daemon running behind the proxy?)`);
+      const acct = await admin.checkCredentials(tw);
+      ok("twilio credentials", `account "${acct.name}"`);
+      credsOk = true;
     } catch (e) {
-      bad("public url", `${publicUrl}/health unreachable (${e instanceof Error ? e.message : String(e)})`);
+      bad("twilio credentials", e instanceof Error ? e.message : String(e));
+    }
+
+    // With a tunnel, the URL is whatever the running daemon last got.
+    let publicUrl = config.publicUrl;
+    if (config.tunnel) {
+      const f = join(config.stateDir, "public-url");
+      publicUrl = existsSync(f) ? readFileSync(f, "utf8").trim() : "";
+      if (!publicUrl) warn("tunnel", "no tunnel URL yet: is the daemon running? (dispatch start)");
+    }
+
+    if (publicUrl) {
+      try {
+        const res = await fetch(`${publicUrl}/health`, { signal: AbortSignal.timeout(8000) });
+        if (res.ok) ok("public url", `${publicUrl}/health`);
+        else bad("public url", `${publicUrl}/health -> HTTP ${res.status} (is the daemon running behind the proxy?)`);
+      } catch (e) {
+        bad("public url", `${publicUrl}/health unreachable (${e instanceof Error ? e.message : String(e)})`);
+      }
+    }
+
+    if (credsOk) {
+      try {
+        const r = await admin.routing(tw, tw.from);
+        const want = publicUrl ? publicUrl + config.webhookPath : "";
+        const where = r.via === "service" ? `Messaging Service "${r.service?.name}"` : `sender ${tw.from}`;
+        if (r.via === "unknown") bad("whatsapp sender", `${tw.from} is not a WhatsApp sender on this account`);
+        else if (want && r.effectiveUrl === want) ok("twilio webhook", `${where} -> ${want}`);
+        else if (tw.from === admin.SANDBOX_ADDRESS)
+          warn("twilio webhook", `sandbox shows ${r.effectiveUrl || "nothing"}; make sure "when a message comes in" at ${admin.SANDBOX_CONSOLE} is ${want || "<public url>/twilio/whatsapp"}`);
+        else bad("twilio webhook", `${where} -> ${r.effectiveUrl || "nothing"}, expected ${want || "<public url>/twilio/whatsapp"}${config.autoWebhook ? " (restart dispatch to re-point it)" : " (set DISPATCH_AUTO_WEBHOOK=true, or set it in the Twilio console)"}`);
+      } catch (e) {
+        warn("twilio webhook", `could not read routing: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
   }
 
-  if (credsOk) {
-    try {
-      const r = await admin.routing(config.twilio, config.twilio.from);
-      const want = publicUrl ? publicUrl + config.webhookPath : "";
-      const where = r.via === "service" ? `Messaging Service "${r.service?.name}"` : `sender ${config.twilio.from}`;
-      if (r.via === "unknown") bad("whatsapp sender", `${config.twilio.from} is not a WhatsApp sender on this account`);
-      else if (want && r.effectiveUrl === want) ok("twilio webhook", `${where} -> ${want}`);
-      else if (config.twilio.from === admin.SANDBOX_ADDRESS)
-        warn("twilio webhook", `sandbox shows ${r.effectiveUrl || "nothing"}; make sure "when a message comes in" at ${admin.SANDBOX_CONSOLE} is ${want || "<public url>/twilio/whatsapp"}`);
-      else bad("twilio webhook", `${where} -> ${r.effectiveUrl || "nothing"}, expected ${want || "<public url>/twilio/whatsapp"}${config.autoWebhook ? " (restart dispatch to re-point it)" : " (set DISPATCH_AUTO_WEBHOOK=true, or set it in the Twilio console)"}`);
-    } catch (e) {
-      warn("twilio webhook", `could not read routing: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-
+  let daemon: Record<string, unknown> | undefined;
   try {
     const { base } = local();
-    const res = await fetch(`${base}/health`, { signal: AbortSignal.timeout(3000) });
-    if (res.ok) ok("daemon", `running on ${base}`);
-    else bad("daemon", `${base}/health -> HTTP ${res.status}`);
+    const { status, json } = await call("/health");
+    if (status === 200) {
+      ok("daemon", `running on ${base}`);
+      daemon = json;
+    } else bad("daemon", `${base}/health -> HTTP ${status}`);
   } catch {
     warn("daemon", "not running (dispatch start, or dispatch service install)");
+  }
+
+  if (config.imessage) {
+    const im = await import("./channels/imessage.js");
+    const handles = Object.keys(config.aliases).filter((a) => a.startsWith("imessage:")).map((a) => a.slice("imessage:".length));
+    ok("imessage handles", handles.join(", "));
+    const own = (await im.macAppleIds()).filter((id) => handles.includes(id));
+    if (own.length) warn("imessage apple id", `this Mac is signed in to ${own.join(", ")}, which you text from. give the Mac its own Apple ID in Messages, or those texts never reach dispatch`);
+    // The daemon is what reads Messages, with its own permissions; its view is the one that counts.
+    const st = (daemon?.channels as Record<string, { ok: boolean; detail?: string }> | undefined)?.imessage;
+    if (st?.ok) ok("imessage", "reading and sending through Messages");
+    else if (st) bad("imessage", st.detail ?? "not working");
+    else {
+      const access = im.chatDbAccess(config.imessage.dbPath);
+      if (access === "missing") bad("imessage", "no Messages database: open Messages and sign in with this Mac's Apple ID");
+      else warn("imessage", `start the daemon to check it can read Messages (it needs Full Disk Access for ${process.execPath})`);
+    }
   }
 
   const settings = join(process.env.HOME ?? "", ".claude", "settings.json");

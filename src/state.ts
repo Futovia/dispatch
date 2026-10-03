@@ -17,6 +17,10 @@ export interface OperatorState {
   verbose: boolean;
   sessions: Partial<Record<WorkerName, string>>;
   lastInboundAt?: string;
+  /** When each of the operator's addresses last texted in (WhatsApp's 24h window is per number). */
+  lastInboundVia?: Record<string, string>;
+  /** The address the operator texted from last; replies go back there. */
+  replyTo?: string;
   /** Things that happened since the operator's last message (alerts, tell outcomes). Fed into the next prompt. */
   notes?: string[];
 }
@@ -38,6 +42,8 @@ export interface StateFile {
   seen: string[];
   /** Recent alerts sent to the phone, newest last. */
   alerts?: AlertRecord[];
+  /** Where each polling channel got to, e.g. the last chat.db message ROWID read. */
+  cursors?: Record<string, number>;
 }
 
 const SEEN_CAP = 500;
@@ -153,6 +159,15 @@ export class State {
     return this.data.alerts ?? [];
   }
 
+  cursor(name: string): number | undefined {
+    return this.data.cursors?.[name];
+  }
+
+  setCursor(name: string, value: number): void {
+    this.data.cursors = { ...(this.data.cursors ?? {}), [name]: value };
+    this.write(this.data);
+  }
+
   /** Every session id dispatch itself drives (so they are never targets of `tell`). */
   ownSessionIds(): string[] {
     const ids: string[] = [];
@@ -163,10 +178,17 @@ export class State {
   /** One line per inbound/outbound message, per operator: a JSONL file for `grep`, a row for history.db. */
   transcript(address: string, entry: Record<string, unknown>): number {
     const t = new Date().toISOString();
-    const file = join(this.transcriptsDir, address.replace(/[^0-9]/g, "") + ".jsonl");
+    const file = join(this.transcriptsDir, transcriptName(address));
     // History first: on a first open it imports the JSONL, which must not already hold this line.
     const id = this.history.record(address, entry, t);
     appendFileSync(file, JSON.stringify({ t, ...entry }) + "\n");
     return id;
   }
+}
+
+/** "whatsapp:+15551234567" -> "15551234567.jsonl" (as always); "imessage:me@x.com" -> "imessage-me@x.com.jsonl". */
+function transcriptName(address: string): string {
+  const handle = address.slice(address.indexOf(":") + 1);
+  if (/^\+?\d+$/.test(handle)) return handle.replace(/[^0-9]/g, "") + ".jsonl";
+  return address.replace(/[^a-zA-Z0-9@._-]/g, "-") + ".jsonl";
 }

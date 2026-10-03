@@ -45,11 +45,11 @@ export function createDispatchServer(deps: ServerDeps): Server {
         if (!authorized(req)) return json(res, 200, { ok: true });
         return json(res, 200, { ok: true, publicUrl: config.publicUrl || null, ...deps.router.snapshot() });
       }
-      if (req.method === "POST" && url.pathname === config.webhookPath) {
-        return await webhook(req, res);
+      if (config.twilio && req.method === "POST" && url.pathname === config.webhookPath) {
+        return await webhook(req, res, config.twilio.authToken);
       }
-      if (req.method === "POST" && url.pathname === config.statusPath) {
-        return await status(req, res);
+      if (config.twilio && req.method === "POST" && url.pathname === config.statusPath) {
+        return await status(req, res, config.twilio.authToken);
       }
       if (req.method === "POST" && url.pathname === "/send") {
         return await send(req, res);
@@ -74,7 +74,7 @@ export function createDispatchServer(deps: ServerDeps): Server {
     }
   });
 
-  async function webhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function webhook(req: IncomingMessage, res: ServerResponse, authToken: string): Promise<void> {
     const signature = header(req, "x-twilio-signature");
     if (!signature) return json(res, 403, { error: "missing signature" });
     const body = await readBody(req);
@@ -82,7 +82,7 @@ export function createDispatchServer(deps: ServerDeps): Server {
     const params = parseForm(body);
     // Twilio signs the public URL it was configured with, not what we see behind the proxy.
     const signedUrl = config.publicUrl + config.webhookPath;
-    if (!verifyTwilioSignature(config.twilio.authToken, signedUrl, params, signature)) {
+    if (!verifyTwilioSignature(authToken, signedUrl, params, signature)) {
       log.warn("bad twilio signature", { from: params.From });
       return json(res, 403, { error: "bad signature" });
     }
@@ -193,13 +193,13 @@ export function createDispatchServer(deps: ServerDeps): Server {
     json(res, 200, { ok: outcome.ok, done: true, ...started, session: outcome.sessionId, text: outcome.text, ms: outcome.ms });
   }
 
-  async function status(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  async function status(req: IncomingMessage, res: ServerResponse, authToken: string): Promise<void> {
     const signature = header(req, "x-twilio-signature");
     if (!signature) return json(res, 403, { error: "missing signature" });
     const body = await readBody(req);
     if (body === null) return json(res, 413, { error: "body too large" });
     const params = parseForm(body);
-    if (!verifyTwilioSignature(config.twilio.authToken, config.publicUrl + config.statusPath, params, signature)) {
+    if (!verifyTwilioSignature(authToken, config.publicUrl + config.statusPath, params, signature)) {
       log.warn("bad twilio signature on status callback");
       return json(res, 403, { error: "bad signature" });
     }

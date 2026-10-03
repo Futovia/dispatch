@@ -8,9 +8,12 @@ import { join } from "node:path";
  * a DISPATCH_* variable, listed in `dispatch init`.
  */
 export type WorkerName = "claude" | "codex";
+export type ChannelName = "whatsapp" | "imessage";
 export type PermissionPolicy = "auto" | "ask";
 
 export interface Config {
+  /** How operators reach the box. iMessage needs a Mac signed in to Messages. */
+  channels: ChannelName[];
   stateDir: string;
   envFile: string;
   host: string;
@@ -29,9 +32,22 @@ export interface Config {
   webhookPath: string;
   /** Path Twilio posts delivery statuses to (under publicUrl). */
   statusPath: string;
-  twilio: { accountSid: string; authToken: string; from: string };
-  /** WhatsApp addresses allowed to drive the box ("whatsapp:+15551234567"). */
+  /** Present when the whatsapp channel is on. */
+  twilio?: { accountSid: string; authToken: string; from: string };
+  /**
+   * The operators, by id: "whatsapp:+15551234567" for a phone number (the key
+   * dispatch has always used, whatever channel they text on), "imessage:me@x.com"
+   * for an operator known only by an Apple ID email.
+   */
   operators: string[];
+  /**
+   * Every address allowed to drive the box, mapped to its operator id. One person
+   * texting on WhatsApp from +1555... and on iMessage from me@icloud.com is one
+   * operator: one conversation, one session, one history.
+   */
+  aliases: Record<string, string>;
+  /** iMessage: Messages' database (overridable for tests) and how often to look at it. */
+  imessage?: { dbPath: string; pollMs: number };
   workspace: string;
   defaultWorker: WorkerName;
   permissions: PermissionPolicy;
@@ -81,6 +97,73 @@ export function parseEnvFile(text: string): Record<string, string> {
   return out;
 }
 
+/** An Apple ID email or a phone number, as Messages records the sender: "me@x.com", "+15551234567". */
+export function normalizeHandle(input: string): string {
+  const s = input.trim().replace(/^imessage:/i, "");
+  if (s.includes("@")) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) throw new ConfigError(`not an email address: ${input}`);
+    return s.toLowerCase();
+  }
+  const digits = s.replace(/[^0-9]/g, "");
+  if (!digits) throw new ConfigError(`not a phone number or email: ${input}`);
+  return `+${digits}`;
+}
+
+function list(v: string | undefined): string[] {
+  return (v ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Operator ids and the alias table. DISPATCH_OPERATORS lists people (a phone
+ * number, or with iMessage an Apple ID email); DISPATCH_IMESSAGE_OPERATORS adds
+ * the iMessage handles they text from, each "handle" or "handle=<operator>".
+ */
+export function resolveOperators(
+  channels: ChannelName[],
+  operatorsVar: string | undefined,
+  imessageVar: string | undefined,
+): { operators: string[]; aliases: Record<string, string> } {
+  const imessage = channels.includes("imessage");
+  const whatsapp = channels.includes("whatsapp");
+  const operators: string[] = [];
+  const aliases: Record<string, string> = {};
+  const idFor = (entry: string): string => {
+    const h = normalizeHandle(entry);
+    if (h.includes("@")) {
+      if (!imessage) throw new ConfigError(`${entry}: an email can only be an operator with the imessage channel on`);
+      return `imessage:${h}`;
+    }
+    return `whatsapp:${h}`;
+  };
+  for (const entry of list(operatorsVar)) {
+    const id = idFor(entry);
+    if (operators.includes(id)) continue;
+    operators.push(id);
+    const handle = id.slice(id.indexOf(":") + 1);
+    if (id.startsWith("whatsapp:") && whatsapp) aliases[id] = id;
+    if (imessage) aliases[`imessage:${handle}`] = id;
+  }
+  if (!operators.length) throw new ConfigError("DISPATCH_OPERATORS must list at least one phone number (or, with iMessage, an Apple ID email)");
+  for (const entry of list(imessageVar)) {
+    if (!imessage) break;
+    const [rawHandle, rawOwner] = entry.split("=").map((s) => s.trim());
+    const handle = normalizeHandle(rawHandle!);
+    let owner: string | undefined;
+    if (rawOwner) {
+      owner = idFor(rawOwner);
+      if (!operators.includes(owner)) throw new ConfigError(`DISPATCH_IMESSAGE_OPERATORS: ${rawOwner} is not in DISPATCH_OPERATORS`);
+    } else {
+      owner = aliases[`imessage:${handle}`] ?? (operators.length === 1 ? operators[0] : undefined);
+      if (!owner) throw new ConfigError(`DISPATCH_IMESSAGE_OPERATORS: say whose handle ${handle} is, e.g. ${handle}=+15551234567`);
+    }
+    aliases[`imessage:${handle}`] = owner;
+  }
+  return { operators, aliases };
+}
+
 /** "whatsapp:+1 (555) 123-4567" / "+15551234567" / "15551234567" -> "whatsapp:+15551234567" */
 export function normalizeAddress(input: string): string {
   const digits = input.replace(/[^0-9]/g, "");
@@ -110,18 +193,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     return v;
   };
 
-  const operators = need("DISPATCH_OPERATORS")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map(normalizeAddress);
-  if (!operators.length) throw new ConfigError("DISPATCH_OPERATORS must list at least one phone number");
+  const channels = [...new Set(list(merged.DISPATCH_CHANNELS || "whatsapp").map((c) => c.toLowerCase()))] as ChannelName[];
+  for (const c of channels) if (c !== "whatsapp" && c !== "imessage") throw new ConfigError(`DISPATCH_CHANNELS: unknown channel ${c} (whatsapp, imessage)`);
+  if (!channels.length) throw new ConfigError("DISPATCH_CHANNELS must name at least one of: whatsapp, imessage");
+  const whatsapp = channels.includes("whatsapp");
+  if (channels.includes("imessage") && (env.DISPATCH_PLATFORM ?? process.platform) !== "darwin") {
+    throw new ConfigError("the imessage channel needs macOS (a Mac signed in to Messages)");
+  }
 
-  const rawUrl = need("DISPATCH_PUBLIC_URL").replace(/\/+$/, "");
+  const { operators, aliases } = resolveOperators(channels, need("DISPATCH_OPERATORS"), merged.DISPATCH_IMESSAGE_OPERATORS);
+
+  // Twilio, the public URL and the webhook only matter for WhatsApp.
+  const rawUrl = whatsapp ? need("DISPATCH_PUBLIC_URL").replace(/\/+$/, "") : "";
   const tunnel = rawUrl === "tunnel";
   const publicUrl = tunnel ? "" : rawUrl;
-  if (!tunnel && !/^https:\/\//.test(publicUrl)) throw new ConfigError("DISPATCH_PUBLIC_URL must be an https origin, or: tunnel");
-  const autoWebhook = /^(1|true|yes|on)$/i.test(merged.DISPATCH_AUTO_WEBHOOK || (tunnel ? "true" : "false"));
+  if (whatsapp && !tunnel && !/^https:\/\//.test(publicUrl)) throw new ConfigError("DISPATCH_PUBLIC_URL must be an https origin, or: tunnel");
+  const autoWebhook = whatsapp && /^(1|true|yes|on)$/i.test(merged.DISPATCH_AUTO_WEBHOOK || (tunnel ? "true" : "false"));
 
   const worker = (merged.DISPATCH_WORKER ?? "claude") as WorkerName;
   if (worker !== "claude" && worker !== "codex") throw new ConfigError("DISPATCH_WORKER must be claude or codex");
@@ -138,6 +225,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     : undefined;
 
   return {
+    channels,
     stateDir,
     envFile,
     host: merged.DISPATCH_HOST || "127.0.0.1",
@@ -149,12 +237,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     allowRoot: /^(1|true|yes|on)$/i.test(merged.DISPATCH_ALLOW_ROOT ?? ""),
     webhookPath: "/twilio/whatsapp",
     statusPath: "/twilio/status",
-    twilio: {
-      accountSid: need("TWILIO_ACCOUNT_SID"),
-      authToken: need("TWILIO_AUTH_TOKEN"),
-      from: normalizeAddress(need("TWILIO_WHATSAPP_FROM")),
-    },
+    twilio: whatsapp
+      ? {
+          accountSid: need("TWILIO_ACCOUNT_SID"),
+          authToken: need("TWILIO_AUTH_TOKEN"),
+          from: normalizeAddress(need("TWILIO_WHATSAPP_FROM")),
+        }
+      : undefined,
     operators,
+    aliases,
+    imessage: channels.includes("imessage")
+      ? {
+          dbPath: merged.DISPATCH_IMESSAGE_DB || join(homedir(), "Library", "Messages", "chat.db"),
+          pollMs: Math.max(250, num(merged.DISPATCH_IMESSAGE_POLL_MS, 1500)),
+        }
+      : undefined,
     workspace: merged.DISPATCH_WORKSPACE || homedir(),
     defaultWorker: worker,
     permissions,
@@ -177,16 +274,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 /** The env template `dispatch init` writes. Doubles as the config reference. */
 export const ENV_TEMPLATE = `# dispatch - text your server. Every setting lives here.
 
-# Twilio (WhatsApp sender). Console -> Messaging -> Senders -> WhatsApp senders.
+# How you text this box: whatsapp, imessage, or whatsapp,imessage.
+# imessage needs this to be a Mac signed in to Messages, ideally with its own Apple ID.
+DISPATCH_CHANNELS=whatsapp
+
+# Twilio (WhatsApp sender). Only needed for whatsapp. Console -> Messaging -> Senders -> WhatsApp senders.
 TWILIO_ACCOUNT_SID=
 TWILIO_AUTH_TOKEN=
 TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
 
-# Who may drive this box. Comma-separated phone numbers. Everyone else is ignored
-# (or forwarded, see DISPATCH_FALLTHROUGH_URL).
+# Who may drive this box. Comma-separated phone numbers (with iMessage, an Apple ID
+# email works too). Everyone else is ignored (or forwarded, see DISPATCH_FALLTHROUGH_URL).
 DISPATCH_OPERATORS=+15551234567
 
-# Public https origin Twilio can reach, e.g. https://dispatch.example.com behind
+# iMessage: the phone numbers and Apple ID emails you text this Mac from, if not
+# just the numbers above. With one operator, every handle here is that operator;
+# with several, write handle=operator (me@icloud.com=+15551234567). WhatsApp and
+# iMessage from the same operator are one conversation; replies go where you last texted from.
+DISPATCH_IMESSAGE_OPERATORS=
+
+# WhatsApp only: public https origin Twilio can reach, e.g. https://dispatch.example.com behind
 # your reverse proxy. Or: tunnel (a free Cloudflare quick tunnel, no domain needed;
 # its URL changes on every restart, so keep DISPATCH_AUTO_WEBHOOK=true with it).
 DISPATCH_PUBLIC_URL=tunnel
