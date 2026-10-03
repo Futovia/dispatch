@@ -90,6 +90,13 @@ async function start(): Promise<void> {
   const config = loadConfig();
   if (config.allowRoot) process.env.DISPATCH_ALLOW_ROOT = "1"; // read by the claude worker
   const state = new State(config.stateDir);
+  // Every inbound text goes through history.db: fail loudly here, not silently per message.
+  try {
+    void state.history;
+  } catch (e) {
+    log.error("cannot open history.db; dispatch needs Node 22.13+ (node:sqlite)", { node: process.version, err: e instanceof Error ? e.message : String(e) });
+    process.exit(1);
+  }
   const sessions = new Sessions(config.stateDir);
   const creds = config.twilio;
 
