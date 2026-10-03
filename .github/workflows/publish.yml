@@ -1,0 +1,29 @@
+# Publishes to npm when a v* tag is pushed, through npm trusted publishing (OIDC):
+# no npm token is stored anywhere. npmjs.com -> @futovia/dispatch -> Settings ->
+# Trusted publisher must list Futovia/dispatch with workflow publish.yml.
+#
+# Release: bump "version" in package.json on main, then
+#   git tag v$(node -p 'require("./package.json").version') && git push origin --tags
+name: publish
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  id-token: write # OIDC token for npm
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: tag matches package.json
+        run: test "v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm publish
