@@ -224,3 +224,5 @@ npm link          # puts your checkout's `dispatch` on PATH
 ```
 
 MIT. Made by [Futovia](https://futovia.com).
+
+Releases publish from GitHub Actions through npm trusted publishing (`.github/workflows/publish.yml`), with no npm token anywhere: bump `version` in `package.json` on `main`, then `git tag v<version> && git push origin --tags`.
