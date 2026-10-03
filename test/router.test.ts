@@ -16,6 +16,8 @@ const STRANGER = "whatsapp:+15559999999";
 
 function config(dir: string, overrides: Partial<Config> = {}): Config {
   return {
+    channels: ["whatsapp"],
+    aliases: { [OP]: OP },
     stateDir: dir,
     envFile: join(dir, "env"),
     host: "127.0.0.1",
@@ -251,6 +253,49 @@ describe("Router", () => {
     await tick();
     expect(claude.calls[0]!.images).toHaveLength(1);
     expect(claude.calls[0]!.images[0]).toMatch(/\.jpg$/);
+  });
+
+  describe("channels", () => {
+    const EMAIL = "imessage:me@icloud.com";
+    const im = (body: string, from = EMAIL) => ({ sid: `imessage:G-${Math.random()}`, channel: "imessage" as const, from, to: "", body, media: [] });
+
+    it("WhatsApp and iMessage from one operator are one conversation, replies follow the last channel", async () => {
+      const { router, state } = make({ channels: ["whatsapp", "imessage"], aliases: { [OP]: OP, [EMAIL]: OP } });
+      await router.handleWebhook(inbound(OP, "on whatsapp"));
+      await tick();
+      await router.handleInbound(im("now on imessage"));
+      await tick();
+      // same session, resumed across channels
+      expect(claude.calls.map((c) => c.resume)).toEqual([undefined, "claude-sess"]);
+      expect(claude.calls[1]!.systemPrompt).toContain("texting you from iMessage");
+      expect(claude.calls[0]!.systemPrompt).toContain("texting you from WhatsApp");
+      // replies go to the operator; the send layer routes by replyTo
+      expect(sent.map((x) => x.to)).toEqual([OP, OP]);
+      const op = state.operator(OP, { worker: "claude", cwd: dir });
+      expect(op.replyTo).toBe(EMAIL);
+      expect(Object.keys(op.lastInboundVia ?? {}).sort()).toEqual([EMAIL, OP].sort());
+      expect(state.history.recent({ operator: OP }).filter((e) => e.dir === "in").map((e) => [e.text, e.meta?.via])).toEqual([
+        ["on whatsapp", undefined],
+        ["now on imessage", EMAIL],
+      ]);
+    });
+
+    it("an iMessage stranger is ignored, never answered, even with a fallthrough reply", async () => {
+      const { router } = make({ channels: ["whatsapp", "imessage"], aliases: { [OP]: OP }, fallthroughReply: "private line." });
+      await router.handleInbound(im("hi", "imessage:someone@else.com"));
+      await tick();
+      expect(sent).toEqual([]);
+      expect(claude.calls).toEqual([]);
+    });
+
+    it("attachments already on disk are handed over as they are", async () => {
+      const { router } = make({ channels: ["imessage"], aliases: { [EMAIL]: OP } });
+      const file = join(dir, "photo.jpg");
+      writeFileSync(file, "jpg");
+      await router.handleInbound({ ...im("look"), media: [{ path: file, contentType: "image/jpeg" }] });
+      await tick();
+      expect(claude.calls[0]!.images).toEqual([file]);
+    });
   });
 
   describe("debounce", () => {

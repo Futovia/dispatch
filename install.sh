@@ -4,8 +4,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/Futovia/dispatch/main/install.sh | bash
 #
 # Installs Node 22 (22.13+) if needed (into your home, no sudo), installs
-# @futovia/dispatch from npm, then runs `dispatch init`, which asks for your
-# Twilio details. Any arguments are passed to `dispatch init`, e.g.
+# @futovia/dispatch from npm, then runs `dispatch init`, which asks how you
+# will text it (WhatsApp through Twilio, or iMessage on a Mac) and sets that up. Any arguments are passed to `dispatch init`, e.g.
 #   curl -fsSL .../install.sh | bash -s -- --sid AC... --token ... --from +1... --operator +44...
 #
 # Run as root (a fresh VPS), it creates a normal user "dispatch" and installs

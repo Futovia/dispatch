@@ -2,7 +2,7 @@
 
 **Text your server.**
 
-A WhatsApp number, wired through Twilio, straight to Claude Code running on your own box. You text, Claude works the machine, you get the result on your phone. It can start fresh Claude sessions for side jobs and run several at once.
+A WhatsApp number (through Twilio), or iMessage on a Mac, straight to Claude Code running on your own box. You text, Claude works the machine, you get the result on your phone. It can start fresh Claude sessions for side jobs and run several at once.
 
 ```
 you:       is the site up? deploy says green but it feels slow
@@ -52,6 +52,25 @@ curl -fsSL https://raw.githubusercontent.com/Futovia/dispatch/main/install.sh | 
 ```
 
 Other flags: `--url https://your.host` instead of the tunnel, `--no-service`, `--no-hooks`, `--no-webhook`, `--shared-service` (allow repointing a Messaging Service that other numbers share).
+
+## iMessage (on a Mac)
+
+On a Mac, dispatch can also take texts over iMessage, with no Twilio account, no tunnel and no public URL. `dispatch init` asks: **whatsapp, imessage, or both**.
+
+1. **Give the Mac its own Apple ID** (a new one is free) and sign in to Messages with it. You text that Apple ID from your iPhone. Your own Apple ID on both ends does not work: a text from an Apple ID to itself counts as one you sent, and dispatch never acts on those. `dispatch init` and `dispatch doctor` warn when the Mac is signed in to an Apple ID you text from.
+2. **Full Disk Access** for the node that runs dispatch, so it can read `~/Library/Messages/chat.db`: System Settings > Privacy & Security > Full Disk Access. `dispatch init` opens that page and shows you the file.
+3. **Automation**: the first reply makes macOS ask to let node control Messages. Click OK (init sends a test iMessage while you are at the Mac).
+4. Keep the Mac awake and logged in (automatic login after a reboot): Messages only runs in a logged-in session.
+
+Your iPhone may text from your phone number or your Apple ID email, depending on its settings. List every one in `DISPATCH_IMESSAGE_OPERATORS`; they are all you. With WhatsApp on too, it is **one conversation**: same session, same history, same debounce. Replies go to wherever you texted from last, except that a message WhatsApp's 24 hour window would block goes by iMessage instead. Only plain 1:1 iMessages from your handles get through: SMS (spoofable), group chats, tapbacks and everyone else are skipped. Photos arrive as files, and iPhone HEIC photos are converted to JPEG.
+
+```
+DISPATCH_CHANNELS=whatsapp,imessage
+DISPATCH_OPERATORS=+15551234567
+DISPATCH_IMESSAGE_OPERATORS=me@icloud.com,+15551234567
+```
+
+With several operators, say whose each handle is: `me@icloud.com=+15551234567`. An iMessage-only operator can be just an email: `DISPATCH_OPERATORS=me@icloud.com`.
 
 ## Talking to it
 
@@ -111,7 +130,7 @@ Up to `DISPATCH_MAX_SPAWNS` (default 4) run at once. Each is a normal Claude Cod
 
 ## Security, plainly
 
-- **Only your number gets in.** Every webhook's Twilio signature is checked against your auth token before anything is read; messages from any other number are ignored.
+- **Only your number gets in.** Every webhook's Twilio signature is checked against your auth token before anything is read; messages from any other number are ignored. Over iMessage, only iMessages (not SMS) from your listed handles are read; nobody else is ever answered.
 - **It has your box.** By default (`/auto`) Claude runs with full permissions as the user dispatch runs as, like you at a terminal. That is the point. `/ask` makes it ask you on WhatsApp before every command and file edit.
 - **The tunnel is public, the daemon is not.** Only the webhook and a bare `{"ok":true}` health check answer from outside. Everything else needs a token that only processes running as you can read.
 - **Your secrets stay on the box**, in `~/.dispatch/env` (mode 600).
@@ -185,7 +204,7 @@ Already have a bot on that WhatsApp number? Set `DISPATCH_FALLTHROUGH_URL` to it
 ~/.dispatch/history.db      every message in and out, across sessions, and texts waiting out the debounce (SQLite)
 ~/.dispatch/transcripts/    the same messages as one JSONL per operator; grep is the UI
 ~/.dispatch/media/          photos you sent
-~/.dispatch/public-url      the current tunnel URL
+~/.dispatch/public-url      the current tunnel URL (WhatsApp)
 ```
 
 ## How it works
@@ -212,7 +231,7 @@ Twilio retries webhooks that take longer than 15 seconds, so dispatch acks at on
 
 ## Not built, on purpose (for now)
 
-Voice notes, group chats, several machines behind one number, a web UI, other messaging apps. Open an issue if one of these is the thing standing between you and texting your server.
+Voice notes, group chats, several machines behind one number, a web UI, messaging apps beyond WhatsApp and iMessage. Open an issue if one of these is the thing standing between you and texting your server.
 
 ## Development
 
