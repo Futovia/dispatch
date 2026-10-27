@@ -46,6 +46,8 @@ export interface Config {
    * operator: one conversation, one session, one history.
    */
   aliases: Record<string, string>;
+  /** Channel every message to an operator uses when that operator can be reached on it, whatever channel they last texted from. Unset = follow the last inbound channel. */
+  preferredChannel?: ChannelName;
   /** iMessage: Messages' database (overridable for tests) and how often to look at it. */
   imessage?: { dbPath: string; pollMs: number };
   workspace: string;
@@ -215,6 +217,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const permissions = (merged.DISPATCH_PERMISSIONS ?? "auto") as PermissionPolicy;
   if (permissions !== "auto" && permissions !== "ask") throw new ConfigError("DISPATCH_PERMISSIONS must be auto or ask");
 
+  const preferredRaw = (merged.DISPATCH_PREFERRED_CHANNEL || "").trim().toLowerCase();
+  if (preferredRaw && !channels.includes(preferredRaw as ChannelName)) {
+    throw new ConfigError(`DISPATCH_PREFERRED_CHANNEL: ${preferredRaw} is not one of DISPATCH_CHANNELS (${channels.join(", ")})`);
+  }
+  const preferredChannel = (preferredRaw || undefined) as ChannelName | undefined;
+
   const fallthroughUrl = merged.DISPATCH_FALLTHROUGH_URL;
   const fallthrough = fallthroughUrl
     ? {
@@ -226,6 +234,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   return {
     channels,
+    preferredChannel,
     stateDir,
     envFile,
     host: merged.DISPATCH_HOST || "127.0.0.1",

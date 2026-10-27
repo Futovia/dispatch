@@ -117,6 +117,7 @@ async function start(): Promise<void> {
         up: Object.keys(channels()) as Array<"whatsapp" | "imessage">,
         replyTo: op.replyTo,
         lastInboundVia: op.lastInboundVia,
+        preferred: config.preferredChannel,
         whatsappWindowOpen: (a) => whatsapp?.windowOpen(a) ?? false,
       });
       if (!picked) throw new Error(`no channel can reach ${to}`);

@@ -275,7 +275,8 @@ export class Router {
   private channelFor(operator: string): "whatsapp" | "imessage" {
     const op = this.deps.state.operator(operator, { worker: this.deps.config.defaultWorker, cwd: this.deps.config.workspace });
     const on = this.deps.config.channels;
-    const guess = (op.replyTo && channelOf(op.replyTo)) || channelOf(operator);
+    const pref = this.deps.config.preferredChannel;
+    const guess = (pref && on.includes(pref) ? pref : undefined) || (op.replyTo && channelOf(op.replyTo)) || channelOf(operator);
     return guess && on.includes(guess) ? guess : on[0]!;
   }
 

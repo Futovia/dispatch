@@ -256,6 +256,16 @@ describe("pickAddress", () => {
     expect(pickAddress({ ...base, replyTo: "whatsapp:+1555" })).toBe("whatsapp:+1555");
   });
 
+  it("a preferred channel wins over where the operator texted from last", () => {
+    const via = { "imessage:+1555": "2026-01-01T00:00:00Z", "imessage:me@icloud.com": "2026-02-01T00:00:00Z" };
+    expect(pickAddress({ ...base, preferred: "imessage", replyTo: "whatsapp:+1555", lastInboundVia: via })).toBe("imessage:me@icloud.com");
+    expect(pickAddress({ ...base, preferred: "whatsapp", replyTo: "imessage:me@icloud.com" })).toBe("whatsapp:+1555");
+  });
+
+  it("falls back to the usual routing when the preferred channel is down", () => {
+    expect(pickAddress({ ...base, up: ["whatsapp"], preferred: "imessage", replyTo: "whatsapp:+1555" })).toBe("whatsapp:+1555");
+  });
+
   it("moves to iMessage when WhatsApp's 24h window is closed, to the iMessage address used last", () => {
     expect(
       pickAddress({

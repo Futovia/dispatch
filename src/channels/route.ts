@@ -9,6 +9,8 @@ import { channelOf } from "./types.js";
  *  2. except a WhatsApp number whose 24h window has closed, when iMessage can
  *     carry it instead (iMessage has no window);
  *  3. with nothing to go on: iMessage first (no window), then WhatsApp.
+ * A preferred channel (DISPATCH_PREFERRED_CHANNEL) overrides all of this
+ * whenever the operator has an address on it that is up.
  * Among several addresses on one channel, the one heard from most recently wins.
  */
 export function pickAddress(input: {
@@ -17,6 +19,7 @@ export function pickAddress(input: {
   up: ChannelName[];
   replyTo?: string;
   lastInboundVia?: Record<string, string>;
+  preferred?: ChannelName;
   whatsappWindowOpen: (address: string) => boolean;
 }): string | undefined {
   const { operator, aliases, up, replyTo, lastInboundVia = {} } = input;
@@ -27,6 +30,10 @@ export function pickAddress(input: {
       .filter((a) => channelOf(a) === ch)
       .sort((a, b) => recency(b) - recency(a))[0];
 
+  if (input.preferred) {
+    const pick = best(input.preferred);
+    if (pick) return pick;
+  }
   if (replyTo && mine.includes(replyTo)) {
     if (channelOf(replyTo) === "whatsapp" && !input.whatsappWindowOpen(replyTo) && best("imessage")) return best("imessage");
     return replyTo;
